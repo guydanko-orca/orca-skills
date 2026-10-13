@@ -12,7 +12,7 @@ Blanket admin is the grant nobody revisits: whoever needed elevated access got `
 
 Four facts shape everything below.
 
-**One REST call returns the whole thing.** `GET /api/iaminator` is org-wide, uncapped, and complete — every group with every member in a single response. It is the one Orca surface free of the 50-result ceiling that bounds `discovery_search` and `get_asset_by_name`, so enumeration here is exhaustive rather than best-effort. MCP calls are spent only on a bounded drill-down and on gating an apply.
+**One MCP call returns the whole thing.** `get_recommended_admin_policies` is org-wide, uncapped, and complete: every group with every member in a single response. It is the one Orca surface free of the 50-result ceiling that bounds `discovery_search` and `get_asset_by_name`, so enumeration here is exhaustive rather than best-effort. Beyond that call, MCP calls are spent only on a bounded drill-down and on gating an apply.
 
 **The population is narrower than "everyone with admin".** All three providers select on two conditions: the identity is privileged, **and** it already carries an Orca PoLP recommendation (`RecommendationType` must exist). An admin Orca has not computed a recommendation for is absent entirely. Never present these counts as a complete admin inventory — they are the admins the optimizer can act on.
 
@@ -37,7 +37,7 @@ Natural language: "group our admins", "how many admin policies do we actually ne
 
 > **User:** "group our admins"
 >
-> **The skill** runs the fetch script once (Step 1) and gets all three providers. It reads each cloud's `recommended_plan` and ranks that cloud's groups from artifact fields alone — zero MCP calls so far.
+> **The skill** calls `get_recommended_admin_policies` once (Step 1) and gets all three providers. It reads each cloud's `recommended_plan` and ranks that cloud's groups from artifact fields alone, with no further MCP calls.
 >
 > **The output** leads with the finding that matters: *"62 of the 81 admin identities Orca can act on show no observed activity in the last 90 days: 13 AWS, 19 GCP, 30 Azure."* Then one section per cloud, each with its own table, plan trade-off, and union warnings. Then the privilege-retention check, the inactive hand-off, and the summary.
 >
@@ -55,75 +55,39 @@ Natural language: "group our admins", "how many admin policies do we actually ne
 
 ### Step 1: Fetch the clustering artifact
 
-Run the script that ships beside this file. **Do not hand-roll the credential handling** — reading a token inline and piping it into `curl` is indistinguishable from credential exfiltration to a permission classifier, and gets denied.
+Call `get_recommended_admin_policies` once. It runs on the user's Orca MCP session, so there is no API token or setup step. Call it without arguments by default; pass `cloud_provider` (`aws`, `gcp` or `azure`) only for `--cloud`. Either way the clustering is computed org-wide, so `--account` stays a display filter (see Edge Cases).
 
-```bash
-python3 <skill-dir>/fetch_grouping.py --out <scratchpad>/grouping.json
-```
+Act on the outcome:
 
-It resolves the token, derives the regional host, makes one read-only GET, and writes the JSON. It prints the credential's *source*, the host, and the HTTP result — **never the token**, which also never reaches the output file.
-
-Act on the exit code:
-
-| Exit | Meaning | What to do |
-|---|---|---|
-| **0** | Artifact written | Continue to Step 2. The stdout lines name the providers returned |
-| **2** | No usable credential | Setup is needed. Relay the script's "Checked:" list verbatim — it names every path tried — then the setup instructions below. **Never** report this as a finding about the admin population |
-| **3** | The API returned an error | Relay the script's message. It distinguishes 401 (bad or clipped token), 403 (may be Orca-side, not the caller's token), and 404 (wrong regional host) |
-| **4** | Host unreachable | A network or host problem. Report it as such, not as a result |
-
-Two things about the credential, because both have caused confusing failures:
-
-- **The token is the whole base64 blob**, sent as `Authorization: Token <blob>`. It decodes to `<console-url>||<secret>`, but the inner secret alone returns 401. Decoding is only ever for reading the host.
-- **Orca tokens end in `=` padding, and copy paths strip it.** An unpadded token returns `401 API Token not found`, which reads as expired rather than mangled. The script restores padding automatically; if a user reports a mysterious 401, suspect this first.
-
-**Never ask for the region.** It is inside the token, and the script derives it. Asking sends the user hunting for a value they already gave you.
-
-#### When setup is needed (exit 2)
-
-Report what the script checked, then this. Do not offer a menu — one command is the whole setup.
-
-> **I need an Orca API token before I can read the admin grouping.**
->
-> This is a prerequisite, not something wrong with your setup — your Orca MCP tools work fine. Account-level connectors and the OAuth config authenticate the MCP session, which a REST call cannot reuse, so this endpoint needs its own token.
->
-> **1. Create an API token** in Orca — see [managing API tokens](https://docs.orcasecurity.io/docs/managing-api-tokens). This skill only ever reads through it.
->
-> **2. Save it**, pasting your token in place of `PASTE_YOUR_TOKEN`:
->
-> ```bash
-> mkdir -p ~/.orca && chmod 700 ~/.orca
-> echo 'PASTE_YOUR_TOKEN' > ~/.orca/token && chmod 600 ~/.orca/token
-> ```
->
-> You don't need to tell me your region — the token says which Orca instance it belongs to. No new shell needed.
->
-> **3. Re-run.** Already keep the token elsewhere — a `.mcp.json`, an env file, a dotfile? Tell me the path and I'll read it from there instead.
-
-**If the user names a path, read the token from it and continue in the same turn** — do not make them start over. If they say they *did* set it up and the script found nothing, check the assumption rather than repeating the instructions: confirm the file exists (`ls -l`) and that you are looking at the same home directory their shell writes to. A credential created on another machine or in a container is invisible here, and re-sending setup steps will never surface that.
+| Outcome | What to do |
+|---|---|
+| **Returns** | Continue to Step 2 |
+| **Tool not listed** on the Orca MCP | The connector's tool list predates the tool, or the user's Orca region does not have it yet. Ask the user to reconnect the Orca connector and re-run. **Never** report this as a finding about the admin population |
+| **Error** | Relay the error and stop. Report it as a failed read, never as an empty or clean result |
 
 ### Step 2: Read the plans
 
-The response is keyed by provider, each independent:
+The response holds `recommendations_by_cloud_provider`, keyed by provider, each independent:
 
 ```json
-{ "aws": { "plans": { "plan_2": { "clusters": 2, "mapping": {...},
-             "allowed": 253, "used": 54, "improvement_%": 99.08,
-             "reduced_services": 20316, "updated_risk_margin_services": 189,
-             "updated_risk_margin_%": 0.011 } },
-           "shrink_succeed": true,
-           "general_metrics": { "original_policy_services": 21790,
-             "average_utilized_services": 54, "risk_margin_%": 0.998,
-             "risk_margin_services": 20505, "identities": 11,
-             "recommended_plan": "plan_2" } },
-  "gcp": { ... }, "azure": { ... } }
+{ "recommendations_by_cloud_provider": {
+    "aws": { "plans": { "plan_2": { "clusters": 2, "mapping": {...},
+               "allowed": 253, "used": 54, "improvement_%": 99.08,
+               "reduced_services": 20316, "updated_risk_margin_services": 189,
+               "updated_risk_margin_%": 0.011 } },
+             "shrink_succeed": true,
+             "general_metrics": { "original_policy_services": 21790,
+               "average_utilized_services": 54, "risk_margin_%": 0.998,
+               "risk_margin_services": 20505, "identities": 11,
+               "recommended_plan": "plan_2" } },
+    "gcp": { ... }, "azure": { ... } } }
 ```
 
-**On a 200, two "no data" shapes, and the second matters more than anything else in this step:**
+**On a successful call, two "no data" shapes, and the second matters more than anything else in this step:**
 
 | Response | What to say |
 |---|---|
-| `{}` empty | Orca has not produced a clustering for this org — commonly too small or too uniform an admin population to cluster. Report it as "the clustering has not run", **not** as a clean bill of health, and never invent a numeric threshold to explain it |
+| `recommendations_by_cloud_provider` empty | Orca has not produced a clustering for this org, commonly because the admin population is too small or too uniform to cluster. Report it as "the clustering has not run", **not** as a clean bill of health, and never invent a numeric threshold to explain it |
 | A provider key **absent** | **Ambiguous, and undiagnosable from here.** Three causes collapse into the same silence: the cloud genuinely has no clustering; the read failed upstream; or the provider is not configured. Only Orca-side logs distinguish them. Report the providers that *did* return and call a missing one **unknown** — never "not clustered", never "clean". Offer to raise it with Orca if the user expected it |
 
 A provider key is only ever present with a real payload; there is no per-provider error object to look for. If a payload arrives without `plans`, treat it as unusable data rather than zero groups. Check `shrink_succeed` too: `false` means the clustering did not complete, so report the general metrics and stop.
@@ -265,7 +229,7 @@ Remediation tiers: **Orca-native** (comment on related admin-privilege alerts vi
 Verification is two-stage, because both Orca and the artifact lag the cloud:
 
 - **Immediate, read-only CLI:** `aws iam list-attached-user-policies` / `list-attached-role-policies`, `az role assignment list --assignee`, `gcloud projects get-iam-policy`. Only count a member **Applied** after its check passes.
-- **Orca-side and artifact-side, later:** asset fields refresh on the next scan, the grouping only on its next daily refresh. Never re-query the endpoint right after applying and report "nothing changed" — that is expected.
+- **Orca-side and artifact-side, later:** asset fields refresh on the next scan, the grouping only on its next daily refresh. Never re-query the grouping right after applying and report "nothing changed"; that is expected.
 
 Then always close with the grouping summary.
 
@@ -335,7 +299,7 @@ The same applies to anything else you needed a name for while reasoning. If a ph
 
 ### Grouping summary (after any run that read data)
 
-**Omit this block entirely when nothing was read** — no credential, any non-200, or `shrink_succeed: false`. The setup instructions or the error *are* the output. A summary whose rows all read "unknown" tells the user nothing, buries the one actionable thing, and pattern-matches to a real result at a glance.
+**Omit this block entirely when nothing was read**: the tool was not listed, returned an error, or `shrink_succeed: false`. The error *is* the output. A summary whose rows all read "unknown" tells the user nothing, buries the one actionable thing, and pattern-matches to a real result at a glance.
 
 **Break every count down per cloud.** A pooled number hides which cloud the work is in, and the reader usually owns one.
 
@@ -385,7 +349,7 @@ Do not patch around this in prose. *"`show group 1 permissions` for GCP's list"*
 
 ## Edge Cases
 
-- **Scope is org-wide and cannot be narrowed at the source.** The endpoint takes no account, BU, or tag parameter, and the clustering is computed across the whole org — a subset **cannot** be re-clustered. `--account` and `--cloud` filter *display only*; say so whenever a filter is applied, because a table showing three of a group's twelve members otherwise reads as though the group has three. Account filtering works off the identifier for AWS (the account id is in the ARN); **GCP member ids and Azure principal names carry no account**, so those need member resolution and are only available after a drill-down.
+- **Scope is org-wide and cannot be narrowed at the source.** The tool takes no account, BU, or tag parameter (only `cloud_provider`), and the clustering is computed across the whole org: a subset **cannot** be re-clustered. `--account` filters *display only*, and `--cloud` only limits which providers come back; neither changes the groups, so say so whenever a filter is applied, because a table showing three of a group's twelve members otherwise reads as though the group has three. Account filtering works off the identifier for AWS (the account id is in the ARN); **GCP member ids and Azure principal names carry no account**, so those need member resolution and are only available after a drill-down.
 - **A named admin is missing.** On AWS, first check whether it is AWS-managed or SSO reserved — those are filtered out upstream and will never appear, however much admin they hold. Otherwise the likely cause is that Orca has not computed a PoLP recommendation for it yet. Either way, check the identity directly rather than claiming it is not an admin.
 - **Only one or two plans present:** normal. Only a selection of group counts is ever returned; gaps are by design, not truncation.
 - **A group with one member:** no union tax, no cross-inheritance, usually the safest first apply. Call it out as the easy win.
@@ -405,7 +369,7 @@ Load the MCP tools in a **single ToolSearch at the start of the run** — never 
 
 | Surface | Purpose |
 |---|---|
-| `fetch_grouping.py` (bundled) | The entire grouping: plans, groups, members, generated policies. One call, org-wide, uncapped |
+| `get_recommended_admin_policies` | The entire grouping: plans, groups, members, generated policies. One call, org-wide, uncapped; optional `cloud_provider` filter |
 | `get_asset_by_id` | Resolve AWS users (`AwsUser`, by ARN) and GCP members at drill-down (top-N only) |
 | `get_asset_by_name` | Resolve AWS roles (`AwsIamRole` does not take a bare ARN) and Azure principals by UPN; also fetches a user's effective policy as `<arn>_EffectivePolicy` |
 | `get_aws_effective_permissions_policy_on_asset` | Per-member used actions for AWS **roles**; returns empty for users, which take the `get_asset_by_name` path above |
@@ -413,8 +377,6 @@ Load the MCP tools in a **single ToolSearch at the start of the run** — never 
 | `get_linked_entities_mapping` | Blast radius for roles, service principals, and managed identities before an apply |
 | `get_asset_alerts_count_grouped_by_risk_level` / `get_asset_related_alerts_summary` | Drill-down ranking bumps, top-N only |
 | `add_alert_comment` / `update_alert_status` | Orca-native actions on related admin-privilege alerts |
-
-There is no MCP tool for the clustering artifact — it is reachable only through the REST endpoint, which needs token auth rather than the MCP's OAuth session.
 
 ## Implementation Notes
 

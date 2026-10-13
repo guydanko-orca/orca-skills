@@ -1277,19 +1277,10 @@ RIGHT-SIZING SUMMARY  (engine window: ~90 days)
 
 **"How few policies do our admins actually need, and who goes in each one?"**
 
-> **Needs an Orca API token — you may already have one.** This skill reads an Orca REST endpoint, which cannot reuse an MCP session.
-> - **If you configured the Orca MCP with token auth** (an `.mcp.json` holding `"Authorization": "Token ..."`), you are done. The skill finds it.
-> - **If you use the OAuth MCP config or a claude.ai connector**, there is no token on disk. Create one ([docs](https://docs.orcasecurity.io/docs/managing-api-tokens)) and save it:
->   ```bash
->   mkdir -p ~/.orca && chmod 700 ~/.orca
->   echo 'PASTE_YOUR_TOKEN' > ~/.orca/token && chmod 600 ~/.orca/token
->   ```
-> No region needed — the token identifies its own Orca instance. Just run the skill: if something is missing it names the exact file and problem before reading anything.
-
 Reads Orca's pre-computed admin clustering (IAM Policy Optimizer) for AWS, Azure, and GCP, which has already sorted the org's admin population into groups by what each admin actually does and generated one least-privilege policy per group. Presents the engine's recommended grouping, shows what each group would get instead of blanket `AdministratorAccess` / `Owner`, and drives the swap through a non-destructive path (stage) or a destructive path (apply) that always requires explicit per-group confirmation.
 
 **Features:**
-- One org-wide API call returns every group with every member — no 50-result ceiling, so enumeration is complete rather than best-effort
+- One org-wide MCP call (`get_recommended_admin_policies`) returns every group with every member, with no 50-result ceiling, so enumeration is complete rather than best-effort
 - Defaults to the engine's own recommended plan; other groupings (tighter policies vs fewer policies to maintain) available on request
 - Leads with the inactive bucket: admins Orca found no observed actions for, handed off to `/orca-inactive-identities-cleanup`
 - Surfaces the union trade-off explicitly — a group policy is the union of its members' observed actions, so each member gains whatever their group-mates used
