@@ -24,7 +24,7 @@ sys.path.insert(0, str(_SKILLS_DIR / "lib"))
 sys.path.insert(0, str(_THIS_DIR))
 
 from _json_util import find_last_json_with_key
-from agent_env import agent_env
+from agent_env import HOOKLESS_GIT, agent_env
 from config import load_config
 from impact_agent import ImpactResult, analyze_impact
 from notifier import NotificationPayload, build_notifiers
@@ -222,10 +222,10 @@ def _create_worktree(alert_id: str, branch: str, repo: Repository | None = None)
     cwd = str(repo.clone_path) if (repo and repo.clone_path) else None
 
     # Drop registrations whose directories no longer exist.
-    subprocess.run(["git", "worktree", "prune"], capture_output=True, cwd=cwd)
+    subprocess.run([*HOOKLESS_GIT, "worktree", "prune"], capture_output=True, cwd=cwd)
 
     if path.exists():
-        subprocess.run(["git", "worktree", "remove", "--force", str(path)],
+        subprocess.run([*HOOKLESS_GIT, "worktree", "remove", "--force", str(path)],
                        capture_output=True, cwd=cwd)
         if path.exists():
             # Not a registered worktree of this repo — e.g. the clone it belonged
@@ -241,10 +241,10 @@ def _create_worktree(alert_id: str, branch: str, repo: Repository | None = None)
             raise WorktreeConflict(
                 f"local branch {branch} has commits not in {BASE_BRANCH} — "
                 f"left untouched for review")
-        subprocess.run(["git", "branch", "-D", branch], capture_output=True, cwd=cwd)
+        subprocess.run([*HOOKLESS_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd)
 
-    _, stderr, rc = _run(["git", "worktree", "add", "-b", branch, str(path), BASE_BRANCH],
-                         check=False, cwd=cwd)
+    _, stderr, rc = _run([*HOOKLESS_GIT, "worktree", "add", "-b", branch, str(path),
+                          BASE_BRANCH], check=False, cwd=cwd)
     if rc != 0:
         msg = stderr.strip() or f"git worktree add failed (exit {rc})"
         if "already used by worktree" in msg or "already exists" in msg:
@@ -261,10 +261,10 @@ def _remove_worktree(path: Path | None, branch: str | None = None,
     """
     cwd = str(repo.clone_path) if (repo and repo.clone_path) else None
     if path and path.exists():
-        subprocess.run(["git", "worktree", "remove", "--force", str(path)],
+        subprocess.run([*HOOKLESS_GIT, "worktree", "remove", "--force", str(path)],
                        capture_output=True, cwd=cwd)
     if branch:
-        subprocess.run(["git", "branch", "-D", branch], capture_output=True, cwd=cwd)
+        subprocess.run([*HOOKLESS_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd)
 
 
 def _get_diff(worktree_path: Path) -> str:
@@ -881,9 +881,9 @@ def _push_fix_update(task: AlertTask) -> None:
     the same worktree, so it can leave the same debris behind.
     """
     commit_msg = f"fix(security): retry fix for {task.alert_id}"
-    _run(["git", "add", "--", *_declared_paths(task)], cwd=task.worktree_path)
-    _run(["git", "commit", "-m", commit_msg], cwd=task.worktree_path)
-    _run(["git", "push"], cwd=task.worktree_path)
+    _run([*HOOKLESS_GIT, "add", "--", *_declared_paths(task)], cwd=task.worktree_path)
+    _run([*HOOKLESS_GIT, "commit", "--no-verify", "-m", commit_msg], cwd=task.worktree_path)
+    _run([*HOOKLESS_GIT, "push", "--no-verify"], cwd=task.worktree_path)
 
 
 # ---------------------------------------------------------------------------
@@ -898,9 +898,9 @@ def _revert(worktree_path: Path) -> None:
     would still show a diff. `git clean -fd` honours .gitignore, so ignored build
     artefacts (node_modules, vendor) survive.
     """
-    for cmd in (["git", "reset", "-q"],
-                ["git", "checkout", "--", "."],
-                ["git", "clean", "-fdq"]):
+    for cmd in ([*HOOKLESS_GIT, "reset", "-q"],
+                [*HOOKLESS_GIT, "checkout", "--", "."],
+                [*HOOKLESS_GIT, "clean", "-fdq"]):
         subprocess.run(cmd, cwd=worktree_path, capture_output=True)
 
 
@@ -1641,7 +1641,11 @@ def _clone_repo(repo: Repository) -> Repository:
     path = Path(f"/tmp/orca-global-{safe}")
     if path.exists():
         shutil.rmtree(path)
-    _run(["gh", "repo", "clone", repo.url, str(path), "--", "--depth=1"])
+    # --config lands in the clone's own .git/config before the checkout, so the
+    # clone's checkout and every later git call in it start hookless; the
+    # per-command HOOKLESS_GIT still wins if something rewrites that file.
+    _run(["gh", "repo", "clone", repo.url, str(path), "--", "--depth=1",
+          "--config", "core.hooksPath=/dev/null"])
     repo.clone_path = path
     return repo
 

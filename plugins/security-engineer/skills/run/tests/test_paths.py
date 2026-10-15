@@ -7,6 +7,7 @@ reported — and one of them is an argument to shutil.rmtree.
 
 Run with: python3 tests/test_paths.py
 """
+import os
 import sys
 import tempfile
 import unittest
@@ -194,7 +195,8 @@ class TestUnaccountedChangesBlockTheCommit(unittest.TestCase):
         with patch.object(run_agent, "run") as run:
             run.return_value = ("", "", 0)
             run_agent._stage([])
-            self.assertEqual(run.call_args_list[0].args[0], ["git", "add", "-A"])
+            self.assertEqual(run.call_args_list[0].args[0],
+                             [*run_agent.HOOKLESS_GIT, "add", "-A"])
 
 
 class TestClonedTreesCannotConfigureTheAgent(unittest.TestCase):
@@ -253,6 +255,134 @@ class TestAlertPathsCannotEscapeTheWorktree(unittest.TestCase):
         self.assertIn("resolve_within(worktree_path, manifest_rel)", src)
 
 
+class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
+    """`git commit` and `git push` run the repository's hooks — husky,
+    pre-commit, pre-push — with this process's credentials in the environment.
+    In single-repo mode those are the operator's own hooks, live; and a regen
+    command that executes repository code can point core.hooksPath anywhere
+    mid-run. Plugin-run git must not execute any of them."""
+
+    HOOKS = ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit",
+             "pre-push", "post-checkout", "post-index-change", "reference-transaction")
+
+    def setUp(self):
+        import subprocess
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.markers = base / "markers"
+        self.markers.mkdir()
+        hooks = base / "hooks"
+        hooks.mkdir()
+        for name in self.HOOKS:
+            hook = hooks / name
+            hook.write_text(f"#!/bin/sh\ntouch '{self.markers / name}'\nexit 0\n")
+            hook.chmod(0o755)
+        # Nothing from the developer's own git config may leak in: a global
+        # gpgsign or hooksPath would change what this test measures.
+        self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
+                                           "GIT_CONFIG_NOSYSTEM": "1"})
+        self.env.start()
+        self.remote = base / "remote.git"
+        self.work = base / "work"
+        git = lambda *a, cwd=None: subprocess.run(  # noqa: E731
+            ["git", *a], cwd=cwd, check=True, capture_output=True, text=True)
+        self.git = git
+        git("init", "-q", "--bare", "-b", "main", str(self.remote))
+        git("init", "-q", "-b", "main", str(self.work))
+        for key, value in (("user.name", "t"), ("user.email", "t@example.com"),
+                           ("commit.gpgsign", "false")):
+            git("config", key, value, cwd=self.work)
+        git("remote", "add", "origin", str(self.remote), cwd=self.work)
+        (self.work / "app.py").write_text("x = 1\n")
+        git("add", "app.py", cwd=self.work)
+        git("commit", "-q", "-m", "init", cwd=self.work)
+        git("push", "-q", "origin", "main", cwd=self.work)
+        # Installed last, the way husky's `prepare` script would, so the setup
+        # commits above leave no markers behind.
+        git("config", "core.hooksPath", str(hooks), cwd=self.work)
+        self.cwd = os.getcwd()
+        os.chdir(self.work)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        self.env.stop()
+        self._tmp.cleanup()
+
+    def fired(self):
+        return sorted(p.name for p in self.markers.iterdir())
+
+    def test_the_hooks_do_fire_on_a_plain_commit(self):
+        """Positive control: without it a hook that never runs passes vacuously."""
+        (self.work / "app.py").write_text("x = 2\n")
+        self.git("commit", "-q", "-am", "plain", cwd=self.work)
+        self.assertIn("pre-commit", self.fired())
+        self.assertIn("post-commit", self.fired())
+
+    def test_commit_push_and_retry_push_run_no_hook(self):
+        import argparse
+        import contextlib
+        import io
+        import subprocess
+
+        import run_agent
+        from orca_client import alert_branch_name
+
+        branch = alert_branch_name("orca-1")
+        self.git("checkout", "-q", "-b", branch, cwd=self.work)
+        self.git("branch", "leftover", cwd=self.work)
+        for path in self.markers.iterdir():  # the setup above fires hooks of its own
+            path.unlink()
+
+        real_run = run_agent.run
+
+        def no_gh(cmd, **kw):
+            if cmd[0] == "gh":
+                return "https://github.com/owner/repo/pull/1", "", 0
+            return real_run(cmd, **kw)
+
+        (self.work / "app.py").write_text("x = 3\n")
+        validator.worktree_diff(self.work)   # the first git call after the agent
+        with patch.object(run_agent, "run", side_effect=no_gh), \
+             contextlib.redirect_stdout(io.StringIO()):
+            run_agent.cmd_git_commit(argparse.Namespace(
+                dry_run=False, alert_id="orca-1", message="fix", path=["app.py"]))
+            run_agent.cmd_open_pr(argparse.Namespace(
+                dry_run=False, alert_id="orca-1", title="t", body="b"))
+
+        (self.work / "app.py").write_text("x = 4\n")
+        task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                         feature_type="sast", source="app.py:1", alert_json={},
+                         worktree_path=self.work,
+                         fix_result=FixAgentResult(success=True, files_changed=["app.py"]))
+        orchestrator._push_fix_update(task)
+        orchestrator._revert(self.work)
+        orchestrator._remove_worktree(None, "leftover")
+
+        self.assertEqual(self.fired(), [], "a repository hook ran on plugin git")
+        self.assertNotIn("leftover", self.git("branch", cwd=self.work).stdout)
+        pushed = subprocess.run(["git", f"--git-dir={self.remote}", "log",
+                                 "--format=%s", branch, "--"],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertEqual(pushed.split(), ["fix(security):", "retry", "fix", "for",
+                                          "orca-1", "fix", "init"])
+
+    def test_the_clone_is_hookless_from_the_start(self):
+        """gh repo clone runs git clone, whose checkout can fire a template's
+        post-checkout; the flag also persists into the clone's own config."""
+        src = __import__("inspect").getsource(orchestrator._clone_repo)
+        self.assertIn("core.hooksPath=/dev/null", src)
+
+    def test_worktree_lifecycle_is_hookless(self):
+        """`worktree add` fires post-checkout; `branch -D` fires
+        reference-transaction, in the finally after every alert."""
+        inspect = __import__("inspect")
+        for fn in (orchestrator._create_worktree, orchestrator._remove_worktree):
+            src = inspect.getsource(fn)
+            with self.subTest(fn.__name__):
+                self.assertNotIn('["git", ', src)
+                self.assertIn("HOOKLESS_GIT", src)
+
+
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -265,6 +395,7 @@ if __name__ == "__main__":
         TestUnaccountedChangesBlockTheCommit,
         TestClonedTreesCannotConfigureTheAgent,
         TestAlertPathsCannotEscapeTheWorktree,
+        TestRepoHooksDoNotRunOnPluginGit,
     ]
 
     _registered = {cls.__name__ for cls in test_classes}

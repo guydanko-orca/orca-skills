@@ -283,8 +283,9 @@ tenant wrote, so they get the same allowlist through `build_env()` with Claude's
 own credentials removed as well. `HOME` is still passed, so a build script can
 read credential files under it (`~/.config/gh`, `~/.aws`, `~/.npmrc`); closing
 that needs a sandbox, not an environment. The orchestrator's own `gh` and `git`
-subprocesses are untouched: they need those credentials and are not the untrusted
-party.
+subprocesses keep their environment: they need those credentials and are not the
+untrusted party. The hooks a repository attaches to them are — see *Repository
+hooks do not run on the plugin's git* below.
 
 **A cloned tree is input, never configuration.** `--remote all` clones arbitrary
 tenant repositories into `/tmp`, and the fix agent runs with `cwd` inside one.
@@ -297,6 +298,26 @@ configuration comes from `skills/run/agent-settings.json`, which is versioned
 beside the code, and from nothing in the clone. Verified against claude 2.1.276 —
 with a `CLAUDE.md` imposing a house style in the working directory, an unpinned
 `claude -p` followed it and a pinned one did not.
+
+**Repository hooks do not run on the plugin's git.** `git commit` and `git push`
+run whatever hooks the repository has configured — husky, pre-commit, pre-push —
+in the orchestrator's own environment, which holds the Orca token and `gh`'s
+credentials. In single-repo mode those are the operator's live hooks, and a
+lockfile regen that executes repository code (`bundle lock` evaluates the
+Gemfile) can rewrite `core.hooksPath` in the shared `.git/config` mid-run. Every
+git call the pipeline makes that can fire a hook — the `git add -N` behind the
+diff the gates read, staging, commit, push, revert, and the worktree's creation
+and teardown (`worktree add`/`remove`, `branch -D`) — therefore runs as
+`git -c core.hooksPath=/dev/null …` (`agent_env.HOOKLESS_GIT`), plus
+`--no-verify` on commit and push; a command-line `-c` outranks every config file.
+The `git-setup` subcommand, which only a human runs by hand, is left as it was.
+`--remote` clones also get the setting in their own config before the first
+checkout. The trade-off is deliberate: repo-local hooks — formatters, linters,
+commit-message checks — no longer run on bot commits, so whatever they enforce
+is left to CI (gate 5) and the Orca check (gate 4). Other config keys that can
+name a command (`core.fsmonitor`, `core.sshCommand`, diff and filter drivers) are
+not overridden; a clone does not carry them, so they would have to be written by
+code running during the fix.
 
 **Only declared files are committed.** Staging was `git add -A`, so anything the
 fix agent's Bash left behind that `.gitignore` did not cover — a scratch file, a

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _json_util import find_last_json_with_key
-from agent_env import agent_env, build_env
+from agent_env import HOOKLESS_GIT, agent_env, build_env
 from orca_client import _resolve_feature_type
 from paths import resolve_within
 from redact import build_redactor
@@ -127,9 +127,9 @@ def worktree_diff(worktree_path: Path) -> str:
     shows up, which keeps every gate (sanity, LLM, impact) judging the same set
     of changes the commit will actually contain. Honours .gitignore.
     """
-    subprocess.run(["git", "add", "-A", "-N"],
+    subprocess.run([*HOOKLESS_GIT, "add", "-A", "-N"],
                    cwd=worktree_path, capture_output=True, text=True)
-    return subprocess.run(["git", "diff"],
+    return subprocess.run([*HOOKLESS_GIT, "diff"],
                           cwd=worktree_path, capture_output=True, text=True).stdout
 
 
