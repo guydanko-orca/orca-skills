@@ -364,7 +364,13 @@ credential helpers, ssh command and askpass are taken from the snapshot, after
 `credential.helper=` has emptied every helper any config file named — verified
 with `git credential fill` that a helper planted in the repository, generic or
 URL-scoped, does not run. `url.*.insteadOf` cannot be reset that way, since its
-keys are named by URL, and has not been exercised against a live push. Every gh
+keys are named by URL, and has not been exercised against a live push; a
+planted one is caught by the drift check immediately before the push. The push
+goes to the URL `git remote get-url --push origin` gave when the baseline was
+recorded, not to whatever the remote says later. Only that URL's transport is
+allowed, with every transport pinned by name, since a clone-level
+`protocol.ext.allow` outranks a general `protocol.allow=never`. A test shows a
+planted `ext::` command runs on plain git and not through the push prefix. Every gh
 call names its repository (`--repo`, or a PR URL) and runs from a plugin-owned
 directory that is not a repository, because gh inspects the repository in its
 cwd with our credentials and none of the overrides above. A partial clone, which
@@ -399,12 +405,14 @@ worktrees are removed with `rmtree`, not `git worktree remove`. The local
 branches and worktree registrations are then left behind in the poisoned
 clone. Plugin git must not trip its own check: pushes name an explicit refspec
 instead of `-u`, worktrees are added `--no-track` (either would record an
-upstream in the shared config), and after each exclusive hold that ran only
-plugin git the clone's baseline is re-taken, which absorbs writes no list can
-anticipate, such as git-lfs recording `lfs.*.access`. Fix agents and build checks also run in their own process group,
-killed in full when the command exits or times out. A child left in the
-background therefore cannot rewrite the config after the last check. A child
-that calls `setsid()` itself leaves the group and is not caught.
+upstream in the shared config). The baseline stays fixed. After each exclusive
+hold that ran only plugin git, the config is compared again and one change is
+accepted: git-lfs adding `lfs.<url>.access` or `lfs.<url>.locksverify` on first
+push. Any other difference — a removed line, any other key — poisons the clone.
+Fix agents and build checks also run in their own process group, killed in full
+when the command exits or times out. A child left in the background therefore
+cannot rewrite the config after the last check. A child that leaves the group
+itself — with `setsid()`, or with `setpgid()` alone — is not caught.
 
 What none of this sees: a change made and reverted between two checks, a
 change outside git's config (a `~/.ssh/config` edit, say), and anything a
@@ -415,8 +423,15 @@ Build checks keep the real `HOME`, so they can write `~/.gitconfig`; under
 `--remote all` every repository cloned after that would have read it, and the
 clone itself ran unchecked. So `agent_env.git_config_snapshot()` copies the
 effective system and global config (includes inlined, `include.path` keys
-dropped so nothing is followed back to a live file) into a private 0600 file in
-a 0700 temp directory, and every plugin git and gh call — clone, `ls-remote`,
+dropped so nothing is followed back to a live file) into a read-only (0400)
+file in an anonymous 0700 directory under the real `TMPDIR`. Repository code is
+never given that `TMPDIR`: the fix agent and the build checks get a throwaway
+one. None of that stops code running as the same user from finding or
+rewriting the file. What is enforced is its SHA-256: every git environment the
+plugin builds checks the file against the hash taken when it was written, and
+`run_agent.py` receives the hash with the path. A missing or altered snapshot
+fails that call closed. A child process never takes a snapshot of its own from
+the live config. Every plugin git and gh call — clone, `ls-remote`,
 `run_agent.py` included — runs with `GIT_CONFIG_GLOBAL` pointing at it and
 `GIT_CONFIG_NOSYSTEM=1`. A change to `~/.gitconfig` during a run is not seen by
 the plugin. Conditional `includeIf "gitdir:…"` sections are evaluated against a

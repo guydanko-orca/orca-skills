@@ -296,7 +296,7 @@ class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
         self.env.start()
         # The plugin's git reads its snapshot of the global config; take it
         # from the empty config above, not from the developer's own.
-        self._saved_snapshot = agent_env._snapshot_path
+        self._saved_snapshot = agent_env._snapshot_state()
         agent_env._reset_git_config_snapshot()
         self.remote = base / "remote.git"
         self.work = base / "work"
@@ -336,7 +336,7 @@ class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
     def tearDown(self):
         os.chdir(self.cwd)
         self.env.stop()
-        agent_env._snapshot_path = self._saved_snapshot
+        agent_env._restore_snapshot_state(self._saved_snapshot)
         self._tmp.cleanup()
 
     def fired(self):
@@ -386,7 +386,7 @@ class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
         (self.work / "app.py").write_text("x = 4\n")
         task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
                          feature_type="sast", source="app.py:1", alert_json={},
-                         worktree_path=self.work,
+                         worktree_path=self.work, push_url=str(self.remote),
                          fix_result=FixAgentResult(success=True, files_changed=["app.py"]))
         orchestrator._push_fix_update(task)
         orchestrator._revert(self.work)
@@ -432,7 +432,7 @@ class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
         self.env.start()
         # The plugin's git reads its snapshot of the global config; take it
         # from the empty config above, not from the developer's own.
-        self._saved_snapshot = agent_env._snapshot_path
+        self._saved_snapshot = agent_env._snapshot_state()
         agent_env._reset_git_config_snapshot()
         self.work = Path(self._tmp.name) / "work"
         self.git = lambda *a: subprocess.run(
@@ -444,7 +444,7 @@ class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
 
     def tearDown(self):
         self.env.stop()
-        agent_env._snapshot_path = self._saved_snapshot
+        agent_env._restore_snapshot_state(self._saved_snapshot)
         self._tmp.cleanup()
 
     def test_unchanged_config_is_not_drift(self):
@@ -526,7 +526,7 @@ class TestPlantedGitCommandsGetNoCredentials(unittest.TestCase):
         self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
                                            "GIT_CONFIG_NOSYSTEM": "1", **self.CANARIES})
         self.env.start()
-        self._saved_snapshot = agent_env._snapshot_path
+        self._saved_snapshot = agent_env._snapshot_state()
         agent_env._reset_git_config_snapshot()
         self.work = base / "work"
         self.git = lambda *a, **kw: subprocess.run(
@@ -561,7 +561,7 @@ class TestPlantedGitCommandsGetNoCredentials(unittest.TestCase):
 
     def tearDown(self):
         self.env.stop()
-        agent_env._snapshot_path = self._saved_snapshot
+        agent_env._restore_snapshot_state(self._saved_snapshot)
         self._tmp.cleanup()
 
     def _fired(self):
@@ -612,7 +612,7 @@ class TestPlantedGitCommandsGetNoCredentials(unittest.TestCase):
             agent_env._reset_git_config_snapshot()
             agent_env.git_config_snapshot()
         self.git("config", "credential.https://example.com.helper", str(base / "credential"))
-        subprocess.run([*agent_env.push_git(), "credential", "fill"], cwd=self.work,
+        subprocess.run([*agent_env.push_git("https://example.com/x"), "credential", "fill"], cwd=self.work,
                        input="protocol=https\nhost=example.com\n\n", capture_output=True,
                        text=True, env=agent_env.credentialed_env())
         fired = self._fired()
@@ -658,7 +658,7 @@ class TestPluginGitDoesNotPoisonItsOwnClone(unittest.TestCase):
         self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(operator),
                                            "GIT_CONFIG_NOSYSTEM": "1"})
         self.env.start()
-        self._saved_snapshot = agent_env._snapshot_path
+        self._saved_snapshot = agent_env._snapshot_state()
         agent_env._reset_git_config_snapshot()
         self.remote = base / "remote.git"
         self.clone = base / "clone"
@@ -680,7 +680,7 @@ class TestPluginGitDoesNotPoisonItsOwnClone(unittest.TestCase):
     def tearDown(self):
         os.chdir(self.cwd)
         self.env.stop()
-        agent_env._snapshot_path = self._saved_snapshot
+        agent_env._restore_snapshot_state(self._saved_snapshot)
         orchestrator._reset_clone_guards()
         self._tmp.cleanup()
 
@@ -720,7 +720,7 @@ class TestPluginGitDoesNotPoisonItsOwnClone(unittest.TestCase):
         (path / "app.py").write_text("x = 3\n")
         task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
                          feature_type="sast", source="app.py:1", alert_json={},
-                         worktree_path=path,
+                         worktree_path=path, push_url=str(self.remote),
                          fix_result=FixAgentResult(success=True, files_changed=["app.py"]))
         orchestrator._push_fix_update(task)
         self._assert_unchanged("retry push")
@@ -729,11 +729,9 @@ class TestPluginGitDoesNotPoisonItsOwnClone(unittest.TestCase):
         orchestrator._remove_worktree(path, "fix/orca-orca-1", repo=self.repo)
         self._assert_unchanged("teardown")
 
-    def test_a_write_by_plugin_git_inside_a_checked_step_is_absorbed(self):
-        """Writes plugin git makes that cannot be listed in advance (git-lfs
-        records lfs.*.access) are folded into the baseline, since the check
-        before the step passed and no repository code runs while it holds the
-        clone."""
+    def test_the_one_known_plugin_write_is_absorbed(self):
+        """git-lfs records lfs.<url>.access on first push; that, and only that,
+        is folded into the baseline."""
         import subprocess
 
         from impact_agent import ImpactResult
@@ -769,6 +767,105 @@ class TestPluginGitDoesNotPoisonItsOwnClone(unittest.TestCase):
         self.assertEqual(result.state, "DONE", result.failure_reason)
         self.assertFalse(orchestrator._clone_gate(self.repo).poisoned)
         remove.assert_called_once()
+
+    def test_any_other_write_inside_a_checked_step_poisons_the_clone(self):
+        """A check can pass and the config still change before the step ends —
+        nothing else may be adopted as the new normal."""
+        import subprocess
+        orchestrator._record_config_baseline(self.repo)
+        gate = orchestrator._clone_gate(self.repo)
+        for key, value in (("core.sshCommand", "evil"), ("credential.helper", "!evil")):
+            with self.subTest(key):
+                gate.poisoned = ""
+                subprocess.run(["git", "config", key, value], cwd=self.clone, check=True)
+                orchestrator._settle_after_plugin_git(self.repo, gate)
+                self.assertTrue(gate.poisoned)
+                subprocess.run(["git", "config", "--unset", key], cwd=self.clone, check=True)
+
+
+class TestPushGoesWhereItWasMeantTo(unittest.TestCase):
+    """The push URL is read before repository code runs, and the push may use
+    only that URL's transport — so neither a rewritten remote.origin.pushurl
+    nor config enabling `ext::` can redirect it or turn it into a command."""
+
+    def setUp(self):
+        import subprocess
+        orchestrator._reset_clone_guards()
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
+                                           "GIT_CONFIG_NOSYSTEM": "1"})
+        self.env.start()
+        self._saved_snapshot = agent_env._snapshot_state()
+        agent_env._reset_git_config_snapshot()
+        self.git = lambda *a, cwd=None: subprocess.run(
+            ["git", *a], cwd=cwd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.intended, self.other = base / "intended.git", base / "other.git"
+        for bare in (self.intended, self.other):
+            self.git("init", "-q", "--bare", "-b", "main", str(bare))
+        self.clone = base / "clone"
+        self.git("init", "-q", "-b", "main", str(self.clone))
+        for key, value in (("user.name", "t"), ("user.email", "t@e"),
+                           ("commit.gpgsign", "false")):
+            self.git("config", key, value, cwd=self.clone)
+        self.git("remote", "add", "origin", str(self.intended), cwd=self.clone)
+        (self.clone / "a.py").write_text("x = 1\n")
+        self.git("add", "a.py", cwd=self.clone)
+        self.git("commit", "-qm", "i", cwd=self.clone)
+        self.repo = Repository(name="o/r", url="u", clone_path=self.clone)
+        self.marker = base / "ext-ran"
+
+    def tearDown(self):
+        self.env.stop()
+        agent_env._restore_snapshot_state(self._saved_snapshot)
+        orchestrator._reset_clone_guards()
+        self._tmp.cleanup()
+
+    def test_a_pushurl_rewritten_after_the_baseline_is_ignored(self):
+        orchestrator._record_config_baseline(self.repo)
+        self.git("config", "remote.origin.pushurl", str(self.other), cwd=self.clone)
+        (self.clone / "a.py").write_text("x = 2\n")
+        task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                         feature_type="sast", source="a.py:1", alert_json={},
+                         worktree_path=self.clone, push_url=orchestrator._push_url(self.repo),
+                         fix_result=FixAgentResult(success=True, files_changed=["a.py"]))
+        orchestrator._push_fix_update(task)
+        branch = "refs/heads/fix/orca-orca-1"
+        self.assertEqual(self.git(f"--git-dir={self.intended}", "rev-parse", "--verify",
+                                  branch).returncode, 0)
+        self.assertNotEqual(self.git(f"--git-dir={self.other}", "rev-parse", "--verify",
+                                     branch).returncode, 0)
+
+    def test_config_cannot_turn_the_push_into_a_command(self):
+        self.git("config", "protocol.ext.allow", "always", cwd=self.clone)
+        evil = f"ext::sh -c touch% {self.marker}"
+        plain = self.git("-c", "protocol.ext.allow=always", "push", evil, "HEAD:refs/heads/x",
+                         cwd=self.clone)
+        self.assertTrue(self.marker.exists(), f"positive control: {plain.stderr[-200:]}")
+        self.marker.unlink()
+        self.git(*agent_env.push_git(str(self.intended))[1:], "push", evil,
+                 "HEAD:refs/heads/x", cwd=self.clone)
+        self.assertFalse(self.marker.exists())
+
+    def test_transport_is_read_from_the_url(self):
+        for url, transport in (("https://github.com/o/r.git", "https"),
+                               ("git@github.com:o/r.git", "ssh"),
+                               ("ssh://git@github.com/o/r.git", "ssh"),
+                               ("/srv/git/r.git", "file"),
+                               ("file:///srv/git/r.git", "file")):
+            with self.subTest(url):
+                self.assertEqual(agent_env.push_transport(url), transport)
+        for url in ("ext::sh -c evil", "fd::3", "gopher://x/y"):
+            with self.subTest(url), self.assertRaises(RuntimeError):
+                agent_env.push_transport(url)
+
+    def test_no_recorded_url_means_no_push(self):
+        task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                         feature_type="sast", source="a.py:1", alert_json={},
+                         worktree_path=self.clone,
+                         fix_result=FixAgentResult(success=True, files_changed=["a.py"]))
+        with self.assertRaises(RuntimeError):
+            orchestrator._push_fix_update(task)
 
 
 class TestCloneGate(unittest.TestCase):
@@ -891,7 +988,7 @@ class TestPoisonedCloneRunsNoMoreGit(unittest.TestCase):
         self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
                                            "GIT_CONFIG_NOSYSTEM": "1"})
         self.env.start()
-        self._saved_snapshot = agent_env._snapshot_path
+        self._saved_snapshot = agent_env._snapshot_state()
         agent_env._reset_git_config_snapshot()
         self.work = Path(self._tmp.name) / "work"
         subprocess.run(["git", "init", "-q", str(self.work)], check=True)
@@ -899,7 +996,7 @@ class TestPoisonedCloneRunsNoMoreGit(unittest.TestCase):
 
     def tearDown(self):
         self.env.stop()
-        agent_env._snapshot_path = self._saved_snapshot
+        agent_env._restore_snapshot_state(self._saved_snapshot)
         orchestrator._reset_clone_guards()
         self._tmp.cleanup()
 
@@ -1074,13 +1171,13 @@ class TestGitConfigIsReadOnceAtStart(unittest.TestCase):
         self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(self.global_cfg),
                                            "GIT_CONFIG_NOSYSTEM": "1"})
         self.env.start()
-        self._saved_snapshot = agent_env._snapshot_path
+        self._saved_snapshot = agent_env._snapshot_state()
         agent_env._reset_git_config_snapshot()
         os.environ.pop(agent_env.GIT_SNAPSHOT_ENV, None)
 
     def tearDown(self):
         self.env.stop()
-        agent_env._snapshot_path = self._saved_snapshot
+        agent_env._restore_snapshot_state(self._saved_snapshot)
         self._tmp.cleanup()
 
     def _get(self, key):
@@ -1100,18 +1197,80 @@ class TestGitConfigIsReadOnceAtStart(unittest.TestCase):
         self.assertNotIn(str(self.included).lower(), text)
         self.assertNotIn("osxkeychain", text, "GIT_CONFIG_NOSYSTEM=1 is honoured")
 
-    def test_the_snapshot_is_private(self):
+    def test_the_snapshot_is_private_and_read_only(self):
         snapshot = Path(agent_env.git_config_snapshot())
-        self.assertEqual(snapshot.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(snapshot.stat().st_mode & 0o777, 0o400)
         self.assertEqual(snapshot.parent.stat().st_mode & 0o777, 0o700)
+        self.assertNotIn("security-engineer", str(snapshot))
 
     def test_child_processes_inherit_the_same_snapshot(self):
         env = agent_env.git_env()
         self.assertEqual(env[agent_env.GIT_SNAPSHOT_ENV], env["GIT_CONFIG_GLOBAL"])
         self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
         agent_env._reset_git_config_snapshot()
-        with patch.dict(os.environ, {agent_env.GIT_SNAPSHOT_ENV: env["GIT_CONFIG_GLOBAL"]}):
+        with patch.dict(os.environ, {
+                agent_env.GIT_SNAPSHOT_ENV: env["GIT_CONFIG_GLOBAL"],
+                agent_env.GIT_SNAPSHOT_SHA_ENV: env[agent_env.GIT_SNAPSHOT_SHA_ENV]}):
             self.assertEqual(agent_env.git_config_snapshot(), env["GIT_CONFIG_GLOBAL"])
+
+    def test_a_modified_snapshot_fails_every_git_call_closed(self):
+        snapshot = Path(agent_env.git_config_snapshot())
+        snapshot.chmod(0o600)
+        with snapshot.open("a") as f:
+            f.write("[credential]\n\thelper = !evil\n")
+        def push_git():
+            return agent_env.push_git("https://example.com/x")
+
+        for make in (agent_env.git_env, agent_env.credentialed_env, agent_env.run_env,
+                     agent_env.neutral_dir, push_git):
+            with self.subTest(make.__name__), self.assertRaises(RuntimeError):
+                make()
+
+    def test_a_deleted_snapshot_fails_closed_without_resnapshotting(self):
+        snapshot = Path(agent_env.git_config_snapshot())
+        snapshot.chmod(0o600)
+        snapshot.unlink()
+        with self.assertRaises(RuntimeError):
+            agent_env.credentialed_env()
+        self.assertFalse(snapshot.exists(), "no silent snapshot of the live config")
+
+    def test_a_child_never_resnapshots_the_live_config(self):
+        env = agent_env.git_env()
+        for desc, overrides in (
+                ("missing file", {agent_env.GIT_SNAPSHOT_ENV: env["GIT_CONFIG_GLOBAL"] + "-gone",
+                                  agent_env.GIT_SNAPSHOT_SHA_ENV: "0" * 64}),
+                ("wrong hash", {agent_env.GIT_SNAPSHOT_ENV: env["GIT_CONFIG_GLOBAL"],
+                                agent_env.GIT_SNAPSHOT_SHA_ENV: "0" * 64}),
+                ("no hash", {agent_env.GIT_SNAPSHOT_ENV: env["GIT_CONFIG_GLOBAL"]})):
+            with self.subTest(desc):
+                agent_env._reset_git_config_snapshot()
+                with patch.dict(os.environ, overrides), \
+                     patch.object(agent_env, "_write_snapshot",
+                                  side_effect=AssertionError("re-snapshotted")):
+                    os.environ.pop(agent_env.GIT_SNAPSHOT_SHA_ENV, None) \
+                        if desc == "no hash" else None
+                    with self.assertRaises(RuntimeError):
+                        agent_env.git_config_snapshot()
+
+    def test_the_clone_fails_closed_on_a_modified_snapshot(self):
+        from orca_client import Repository
+        snapshot = Path(agent_env.git_config_snapshot())
+        snapshot.chmod(0o600)
+        snapshot.write_text("[core]\n\tsshCommand = evil\n")
+        with patch("orchestrator.subprocess.run") as run, \
+             patch("orchestrator.shutil.rmtree"), self.assertRaises(RuntimeError):
+            orchestrator._clone_repo(Repository(name="o/r", url="https://github.com/o/r"))
+        run.assert_not_called()
+
+    def test_repository_code_gets_a_throwaway_tmpdir(self):
+        import tempfile as tf
+        snapshot_dir = Path(agent_env.git_config_snapshot()).parent
+        for make in (agent_env.build_env, agent_env.agent_env):
+            with self.subTest(make.__name__):
+                tmp = make([])["TMPDIR"]
+                self.assertNotEqual(Path(tmp).resolve(), Path(tf.gettempdir()).resolve())
+                self.assertNotIn(snapshot_dir.resolve(), Path(tmp).resolve().parents)
+                self.assertTrue(Path(tmp).is_dir())
 
     def test_old_git_fails_closed(self):
         with patch.object(agent_env, "_git_version", return_value=(2, 31)), \
@@ -1161,6 +1320,7 @@ if __name__ == "__main__":
         TestFixAgentCannotRewriteGitConfig,
         TestPlantedGitCommandsGetNoCredentials,
         TestPluginGitDoesNotPoisonItsOwnClone,
+        TestPushGoesWhereItWasMeantTo,
         TestCloneGate,
         TestRepositoryCodeHoldsTheGateOnlyWhileItRuns,
         TestPoisonedCloneRunsNoMoreGit,

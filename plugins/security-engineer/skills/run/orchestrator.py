@@ -12,6 +12,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -145,6 +146,9 @@ class AlertTask:
     # Why review is needed, one entry per gate that could not confirm the fix.
     # The bool drives the label; these survive the label failing to apply.
     review_reasons: list[str] = field(default_factory=list)
+    # Where pushes go: the clone's push URL as read before any repository code
+    # ran, so a later rewrite of remote.origin.pushurl changes nothing.
+    push_url: str = ""
     # The PR body as last published, so a reason discovered after the PR opened
     # can be compared against it and pushed only when it actually changed.
     pr_body: str = ""
@@ -300,6 +304,7 @@ def _remove_worktree(path: Path | None, branch: str | None = None,
 # worktree: an alert that starts after another poisoned it must compare against
 # the config from before, not adopt the poisoned one.
 _CONFIG_BASELINES: dict[str, str] = {}
+_PUSH_URLS: dict[str, str] = {}
 _CONFIG_LOCK = threading.Lock()
 _SHOW_SCOPE: list = []   # probed once: [bool]
 
@@ -314,8 +319,8 @@ def _supports_show_scope() -> bool:
                                     "--show-scope"], capture_output=True, text=True,
                                    timeout=30, env=git_env())
                 _SHOW_SCOPE.append(r.returncode == 0)
-            except (OSError, subprocess.TimeoutExpired):
-                _SHOW_SCOPE.append(False)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                return False
         return _SHOW_SCOPE[0]
 
 
@@ -327,12 +332,13 @@ def _git_config_snapshot(where: Path) -> str | None:
     identical config.
     """
     cmd = ["git", "config", "--list", "--includes"]
-    if _supports_show_scope():
-        cmd.append("--show-scope")
     try:
+        if _supports_show_scope():
+            cmd.append("--show-scope")
         r = subprocess.run(cmd, cwd=where, capture_output=True, text=True, timeout=30,
                            env=git_env())
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        # RuntimeError: the snapshot was tampered with. Unknown means closed.
         return None
     return r.stdout if r.returncode == 0 and isinstance(r.stdout, str) else None
 
@@ -359,22 +365,54 @@ def _record_config_baseline(repo: Repository | None) -> str | None:
     snapshot = _git_config_snapshot(Path(key))
     if snapshot is None:
         return None
+    try:
+        url, _, rc = _run([*SAFE_GIT, "remote", "get-url", "--push", "origin"],
+                          check=False, cwd=Path(key), env=git_env())
+    except (OSError, RuntimeError):
+        url, rc = "", 1
     with _CONFIG_LOCK:
+        if rc == 0 and isinstance(url, str) and url:
+            _PUSH_URLS.setdefault(key, url)
         return _CONFIG_BASELINES.setdefault(key, snapshot)
 
 
-def _rebaseline(repo: Repository | None) -> None:
-    """Adopt the config as it stands after git the plugin itself ran.
+def _push_url(repo: Repository | None) -> str:
+    with _CONFIG_LOCK:
+        return _PUSH_URLS.get(_clone_root(repo), "")
 
-    Only ever called at the end of an exclusive hold that began with a passing
-    check and ran no repository code, so anything that changed in between —
-    git-lfs recording lfs.*.access, say — was written by plugin git.
+
+# The only config change plugin git is known to make: git-lfs records what a
+# server supports (`lfs.<url>.access`, `lfs.<url>.locksverify`) on first push.
+_EXPECTED_PLUGIN_WRITE = re.compile(r"^(?:local\t)?lfs\.[^=\n]*\.(?:access|locksverify)=.*$")
+
+
+def _settle_after_plugin_git(repo: Repository | None, gate) -> None:
+    """After git the plugin ran, accept only the changes it is known to make.
+
+    Called at the end of an exclusive hold that began with a passing check and
+    ran no repository code. Even so, a change is adopted only if it is a known
+    plugin write: anything else — a removed line, any other key — means the
+    config was not what the check saw, and the clone is poisoned.
     """
     key = _clone_root(repo)
-    snapshot = _git_config_snapshot(Path(key))
-    if snapshot is not None:
+    with _CONFIG_LOCK:
+        baseline = _CONFIG_BASELINES.get(key)
+    current = _git_config_snapshot(Path(key))
+    if current is None or baseline is None:
+        gate.poisoned = gate.poisoned or ("could not list the git config after plugin "
+                                          "git ran — failing closed")
+        return
+    if current == baseline:
+        return
+    before, after = baseline.splitlines(), current.splitlines()
+    removed = [line for line in before if line not in after]
+    added = [line for line in after if line not in before]
+    if not removed and added and all(_EXPECTED_PLUGIN_WRITE.match(a) for a in added):
         with _CONFIG_LOCK:
-            _CONFIG_BASELINES[key] = snapshot
+            _CONFIG_BASELINES[key] = current
+        return
+    gate.poisoned = gate.poisoned or ("git config changed in a way plugin git does not "
+                                      "— the clone is no longer trusted")
 
 
 def _config_drift(worktree: Path, baseline: str | None) -> str:
@@ -454,6 +492,7 @@ def _reset_clone_guards() -> None:
     """Tests only: forget every baseline, gate and probed git capability."""
     with _CONFIG_LOCK:
         _CONFIG_BASELINES.clear()
+        _PUSH_URLS.clear()
         _SHOW_SCOPE.clear()
         _GATES.clear()
 
@@ -1052,10 +1091,14 @@ def _commit_and_pr(task: AlertTask, impact: ImpactResult | None, dry_run: bool) 
     _run(["python3", _RUN_AGENT, "git-commit", task.alert_id, commit_msg, *stage_args],
          cwd=task.worktree_path)
 
+    if not task.push_url:
+        raise RuntimeError("no push URL was recorded for this clone before repository "
+                           "code ran — not pushing")
     stdout, _, _ = _run([
         "python3", _RUN_AGENT, "open-pr", task.alert_id,
         "--title", pr_title,
         "--body", pr_body,
+        "--push-url", task.push_url,
     ], cwd=task.worktree_path)
 
     pr_url = stdout.strip().split("\n")[-1].strip()
@@ -1079,8 +1122,10 @@ def _push_fix_update(task: AlertTask) -> None:
     _run([*SAFE_GIT, "commit", "--no-verify", "-m", commit_msg], cwd=task.worktree_path,
          env=credentialed_env())
     branch = alert_branch_name(task.alert_id)
-    _run([*push_git(), "push", "--no-verify", "origin", f"HEAD:refs/heads/{branch}"],
-         cwd=task.worktree_path, env=credentialed_env())
+    if not task.push_url:
+        raise RuntimeError("no push URL was recorded for this clone — not pushing")
+    _run([*push_git(task.push_url), "push", "--no-verify", task.push_url,
+          f"HEAD:refs/heads/{branch}"], cwd=task.worktree_path, env=credentialed_env())
 
 
 # ---------------------------------------------------------------------------
@@ -1148,6 +1193,7 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
 
     gate = _clone_gate(repo)
     baseline = _record_config_baseline(repo)
+    task.push_url = _push_url(repo)
     with gate.exclusive():
         reason = gate.poisoned or _config_drift(Path(_clone_root(repo)), baseline)
         if reason:
@@ -1166,7 +1212,7 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
             task.failure_reason = f"worktree creation failed: {e}"
             return task
         finally:
-            _rebaseline(repo)
+            _settle_after_plugin_git(repo, gate)
 
     try:
         # Repository code — the fix agent, the build checks — runs only through
@@ -1186,7 +1232,7 @@ def _teardown(task: AlertTask, branch: str, repo: Repository, gate: _CloneGate) 
             try:
                 _remove_worktree(task.worktree_path, branch, repo=repo)
             finally:
-                _rebaseline(repo)
+                _settle_after_plugin_git(repo, gate)
             return
         gate.poisoned = reason
         path = task.worktree_path
@@ -1249,7 +1295,7 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                 try:
                     return True, step()
                 finally:
-                    _rebaseline(repo)
+                    _settle_after_plugin_git(repo, gate)
             gate.poisoned = reason
             task.state = "FAILED"
             task.failure_reason = reason

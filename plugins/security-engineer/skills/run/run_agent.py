@@ -370,7 +370,12 @@ def cmd_open_pr(args):
             raise RuntimeError("could not read the repository from the origin remote")
         # An explicit refspec and no -u: recording the upstream writes the shared
         # .git/config, which the drift check would then read as tampering.
-        run([*push_git(), "push", "--no-verify", "origin", f"HEAD:refs/heads/{branch}"],
+        # The URL recorded before repository code ran, not whatever the remote
+        # says now. By hand, without --push-url, it is read here.
+        url = getattr(args, "push_url", None)
+        if not url:
+            url, _, _ = run([*SAFE_GIT, "remote", "get-url", "--push", "origin"])
+        run([*push_git(url), "push", "--no-verify", url, f"HEAD:refs/heads/{branch}"],
             env=credentialed_env())
         # Named explicitly and run outside the clone: gh otherwise inspects the
         # repository in its cwd with our credentials and none of push_git's
@@ -453,6 +458,8 @@ def main():
     p_pr.add_argument("alert_id")
     p_pr.add_argument("--title", required=True)
     p_pr.add_argument("--body", required=True)
+    p_pr.add_argument("--push-url", default=None,
+                      help="Push here rather than to the remote's current URL")
 
     args = parser.parse_args()
 

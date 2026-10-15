@@ -18,6 +18,7 @@ repository can attach to them are, so they run through HOOKLESS_GIT.
 """
 import atexit
 import contextlib
+import hashlib
 import os
 import re
 import shutil
@@ -139,7 +140,22 @@ def agent_env(extra: list | None = None) -> dict:
     # starts while keeping them for itself. Forced, so an inherited "0" cannot
     # turn it off. Verified against claude 2.1.299 with a canary variable.
     env[_SCRUB] = "1"
+    # Never the real TMPDIR: it is where the plugin keeps its git config
+    # snapshot. Repository code gets a directory of its own.
+    env["TMPDIR"] = _throwaway_tmpdir()
     return env
+
+
+_throwaway: list[str] = []
+
+
+def _throwaway_tmpdir() -> str:
+    with _snapshot_lock:
+        if not _throwaway:
+            path = tempfile.mkdtemp(prefix="se-scratch-")
+            atexit.register(shutil.rmtree, path, ignore_errors=True)
+            _throwaway.append(path)
+        return _throwaway[0]
 
 
 def build_env(extra: list | None = None) -> dict:
@@ -159,8 +175,13 @@ def build_env(extra: list | None = None) -> dict:
 # Where a child process (run_agent.py) finds the snapshot its parent made, so a
 # run reads the operator's global config exactly once.
 GIT_SNAPSHOT_ENV = "SECURITY_ENGINEER_GIT_CONFIG"
+# ...and the hash it must still have. Same-user code can find and write any file
+# this process can, so the snapshot is not trusted for being hidden or
+# read-only: it is checked against this hash every time it is handed to git.
+GIT_SNAPSHOT_SHA_ENV = "SECURITY_ENGINEER_GIT_CONFIG_SHA256"
 
 _snapshot_path: str | None = None
+_snapshot_sha: str | None = None
 _snapshot_lock = threading.Lock()
 
 # GIT_CONFIG_GLOBAL, the override everything here rests on, arrived in git 2.32.
@@ -202,7 +223,8 @@ def _write_snapshot() -> str:
     if _git_version() < _MIN_GIT:
         raise RuntimeError("git >= 2.32 is required: the plugin isolates every git "
                            "call from ~/.gitconfig with GIT_CONFIG_GLOBAL")
-    directory = tempfile.mkdtemp(prefix="security-engineer-git-")   # 0700
+    # 0700, anonymous, under the real TMPDIR — which repository code is not given.
+    directory = tempfile.mkdtemp()
     atexit.register(shutil.rmtree, directory, ignore_errors=True)
     path = os.path.join(directory, "gitconfig")
     os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
@@ -213,7 +235,16 @@ def _write_snapshot() -> str:
     for key, value in (*system, *_scope_entries("--global", directory)):
         subprocess.run(["git", "config", "--file", path, "--add", key, value],
                        cwd=directory, check=True, capture_output=True)
+    os.chmod(path, 0o400)
     return path
+
+
+def _sha256(path: str) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
 
 
 def git_config_snapshot() -> str:
@@ -225,20 +256,44 @@ def git_config_snapshot() -> str:
     so a build check that rewrites ~/.gitconfig mid-run changes nothing the
     plugin's git sees, for this alert or for a repository cloned later.
     """
-    global _snapshot_path
+    global _snapshot_path, _snapshot_sha
     with _snapshot_lock:
         if _snapshot_path is None:
             inherited = os.environ.get(GIT_SNAPSHOT_ENV)
-            _snapshot_path = (inherited if inherited and os.path.isfile(inherited)
-                              else _write_snapshot())
+            if inherited:
+                # A child of a run. Never a snapshot of its own: the live config
+                # may have been rewritten since the run began.
+                expected = os.environ.get(GIT_SNAPSHOT_SHA_ENV)
+                if not expected:
+                    raise RuntimeError("inherited git config snapshot has no hash — "
+                                       "failing closed")
+                _snapshot_path, _snapshot_sha = inherited, expected
+            else:
+                path = _write_snapshot()
+                _snapshot_path, _snapshot_sha = path, _sha256(path)
+        if _sha256(_snapshot_path) != _snapshot_sha:
+            raise RuntimeError("the plugin's git config snapshot is missing or was "
+                               "modified — failing closed")
         return _snapshot_path
 
 
 def _reset_git_config_snapshot() -> None:
     """Tests only: forget the snapshot so the next call takes a fresh one."""
-    global _snapshot_path
+    global _snapshot_path, _snapshot_sha
     with _snapshot_lock:
-        _snapshot_path = None
+        _snapshot_path = _snapshot_sha = None
+
+
+def _snapshot_state() -> tuple:
+    """Tests only."""
+    return _snapshot_path, _snapshot_sha
+
+
+def _restore_snapshot_state(state: tuple) -> None:
+    """Tests only."""
+    global _snapshot_path, _snapshot_sha
+    with _snapshot_lock:
+        _snapshot_path, _snapshot_sha = state
 
 
 def isolate_git_config(env: dict) -> dict:
@@ -248,6 +303,7 @@ def isolate_git_config(env: dict) -> dict:
     env["GIT_CONFIG_GLOBAL"] = git_config_snapshot()
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env[GIT_SNAPSHOT_ENV] = env["GIT_CONFIG_GLOBAL"]
+    env[GIT_SNAPSHOT_SHA_ENV] = _snapshot_sha
     return env
 
 
@@ -302,7 +358,25 @@ def _snapshot_values(pattern) -> list[tuple[str, str]]:
     return [(key, value) for key, _, value in entries if pattern.match(key)]
 
 
-def push_git() -> list[str]:
+_TRANSPORTS = ("ext", "fd", "file", "git", "http", "https", "ssh")
+
+
+def push_transport(url: str) -> str:
+    """The one transport a push URL needs: https, http, ssh or file."""
+    if "://" in url:
+        scheme = url.split("://", 1)[0].lower()
+        scheme = {"git+ssh": "ssh", "ssh+git": "ssh"}.get(scheme, scheme)
+        if scheme in ("https", "http", "ssh", "file"):
+            return scheme
+        raise RuntimeError(f"refusing to push over {scheme!r}")
+    if "::" in url:
+        raise RuntimeError("refusing to push through a remote helper")
+    if re.match(r"^[^/]+:", url):          # scp-like: git@host:owner/repo
+        return "ssh"
+    return "file"
+
+
+def push_git(url: str) -> list[str]:
     """The git prefix for a push: the operator's own credential and ssh setup,
     from the snapshot, and nothing a clone's config added.
 
@@ -313,6 +387,10 @@ def push_git() -> list[str]:
     URL-scoped, does not run. url.*.insteadOf cannot be reset this way, because
     its keys are named by URL; a planted one is caught by the drift check made
     immediately before the push.
+
+    url: the push URL recorded before any repository code ran. Only its own
+    transport is allowed, so neither a rewritten URL nor config can turn the
+    push into `ext::` (which runs a command) or any other transport.
     """
     prefix = [*HOOKLESS_GIT, "-c", "credential.helper="]
     for key, value in _snapshot_values(_CREDENTIAL_HELPER):
@@ -322,7 +400,14 @@ def push_git() -> list[str]:
     prefix += ["-c", f"core.sshCommand={ssh[-1] if ssh else 'ssh'}",
                "-c", f"core.askPass={askpass[-1] if askpass else ''}",
                "-c", "http.extraHeader=",
-               "-c", "core.attributesFile=/dev/null", "-c", "diff.external="]
+               "-c", "core.attributesFile=/dev/null", "-c", "diff.external=",
+               "-c", "protocol.allow=never"]
+    # Every transport by name: a protocol.<name>.allow in the clone's config
+    # outranks the general protocol.allow, whatever the command line says.
+    allowed = push_transport(url)
+    for transport in _TRANSPORTS:
+        verdict = "always" if transport == allowed else "never"
+        prefix += ["-c", f"protocol.{transport}.allow={verdict}"]
     return prefix
 
 
@@ -394,8 +479,8 @@ def _run_in_group(cmd, *, input=None, timeout=None, cwd=None, env=None
     last drift check and before the push. Where os.waitid exists the group is
     killed while the leader is still an unreaped zombie (WNOWAIT), so its id
     cannot have been reused by an unrelated process; see _exited for where it
-    does not. A child that calls setsid() itself leaves the group and is not
-    caught.
+    does not. A child that leaves the group itself — setsid(), or setpgid()
+    alone — is not caught.
     """
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else
                             subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -424,7 +509,7 @@ def _run_in_group(cmd, *, input=None, timeout=None, cwd=None, env=None
         time.sleep(0.05)
     _kill_group(proc.pid)
     proc.wait()
-    # Bounded: a child that left the group with setsid() and kept the pipe open
+    # Bounded: a child that left the group (setsid or setpgid) and kept the pipe open
     # would otherwise hold the alert forever. Its late output is dropped.
     for reader in readers:
         reader.join(5)

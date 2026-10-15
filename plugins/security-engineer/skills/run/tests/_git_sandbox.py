@@ -20,6 +20,7 @@ def prime() -> str:
         with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
                                      "GIT_CONFIG_NOSYSTEM": "1"}):
             os.environ.pop(agent_env.GIT_SNAPSHOT_ENV, None)
+            os.environ.pop("SECURITY_ENGINEER_GIT_CONFIG_SHA256", None)
             agent_env.git_config_snapshot()
     return agent_env._snapshot_path
 

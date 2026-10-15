@@ -682,6 +682,7 @@ class TestPullRequestBody(unittest.TestCase):
             alert_id="orca-abc123", title="Hardcoded secret", risk_level="high",
             feature_type=feature_type, source="app.py:14",
             alert_json=alert, worktree_path=Path("/tmp/x"),
+            push_url="https://github.com/o/r.git",
         )
         # files_changed is what _commit_and_pr stages by name, so a task without
         # it is not one the pipeline could ever produce.
@@ -719,6 +720,7 @@ class TestPullRequestBody(unittest.TestCase):
             alert_id="orca-abc123", title=f'leaked {SECRET}', risk_level="high",
             feature_type="secret", source="app.py:14",
             alert_json=alert, worktree_path=Path("/tmp/x"),
+            push_url="https://github.com/o/r.git",
         )
         task.fix_result = orchestrator.FixAgentResult(
             success=True, diff_summary="x", files_changed=["app.py"])
