@@ -477,7 +477,8 @@ class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
              patch("orchestrator.sanity_check") as sanity:
             result = orchestrator.run_one(task, dry_run=False,
                                           notifier=unittest.mock.MagicMock(),
-                                          repo=Repository(name="o/r", url="u"))
+                                          repo=Repository(name="o/r", url="u",
+                                                          clone_path=self.work))
         self.assertEqual(result.state, "FAILED")
         self.assertIn("git config changed", result.failure_reason)
         sanity.assert_not_called()
@@ -489,6 +490,80 @@ class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
         guarded = (src.count("_invoke_fix_agent(") + src.count("_commit_and_pr(")
                    + src.count("_push_fix_update("))
         self.assertEqual(src.count('config_drifted("'), guarded)
+
+
+class TestConfigGuardFailsClosed(unittest.TestCase):
+    """A guard that cannot read the config used to compare None with None and
+    pass. Every way of not knowing now fails the alert."""
+
+    def setUp(self):
+        orchestrator._reset_clone_guards()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.repo = Repository(name="o/r", url="u", clone_path=self.root)
+
+    def tearDown(self):
+        orchestrator._reset_clone_guards()
+        self._tmp.cleanup()
+
+    def _task(self):
+        return AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                         feature_type="sast", source="app.py:1", alert_json={})
+
+    def test_no_baseline_fails_before_any_worktree_git(self):
+        with patch("orchestrator._git_config_snapshot", return_value=None), \
+             patch("orchestrator._create_worktree") as create:
+            result = orchestrator.run_one(self._task(), dry_run=False,
+                                          notifier=unittest.mock.MagicMock(), repo=self.repo)
+        self.assertEqual(result.state, "FAILED")
+        self.assertIn("failing closed", result.failure_reason)
+        create.assert_not_called()
+
+    def test_an_unreadable_config_after_the_agent_fails_the_alert(self):
+        with patch("orchestrator._git_config_snapshot", side_effect=["cfg", None]), \
+             patch("orchestrator._create_worktree", return_value=self.root), \
+             patch("orchestrator._remove_worktree"), \
+             patch("orchestrator._invoke_fix_agent",
+                   return_value=FixAgentResult(success=True, files_changed=["a.py"])), \
+             patch("orchestrator.sanity_check") as sanity:
+            result = orchestrator.run_one(self._task(), dry_run=False,
+                                          notifier=unittest.mock.MagicMock(), repo=self.repo)
+        self.assertEqual(result.state, "FAILED")
+        self.assertIn("could not list the git config", result.failure_reason)
+        sanity.assert_not_called()
+
+    def test_a_failed_read_is_not_cached_as_a_baseline(self):
+        with patch("orchestrator._git_config_snapshot", side_effect=[None, "cfg"]):
+            self.assertIsNone(orchestrator._record_config_baseline(self.repo))
+            self.assertEqual(orchestrator._record_config_baseline(self.repo), "cfg")
+
+    def test_the_clone_key_needs_no_git(self):
+        """--path-format is git 2.31+; and git in a poisoned clone is the risk."""
+        with patch("orchestrator.subprocess.run", side_effect=AssertionError("ran git")):
+            self.assertEqual(orchestrator._clone_root(self.repo), str(self.root.resolve()))
+
+    def test_without_show_scope_a_change_is_still_caught(self):
+        import subprocess
+        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
+                                     "GIT_CONFIG_NOSYSTEM": "1"}):
+            subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+            with patch("orchestrator._supports_show_scope", return_value=False):
+                baseline = orchestrator._record_config_baseline(self.repo)
+                self.assertNotIn("local\t", baseline)
+                self.assertEqual(orchestrator._config_drift(self.root, baseline), "")
+                subprocess.run(["git", "config", "credential.helper", "!evil"],
+                               cwd=self.root, check=True)
+                self.assertIn("git config changed",
+                              orchestrator._config_drift(self.root, baseline))
+
+    def test_baselines_are_recorded_before_any_repository_code(self):
+        import inspect
+        src = inspect.getsource(orchestrator._run_repo_pipeline)
+        self.assertLess(src.index("_clone_repo(repo)"), src.index("_record_config_baseline(repo)"))
+        self.assertLess(src.index("_record_config_baseline(repo)"),
+                        src.index("pool.submit(run_one"))
+        main = inspect.getsource(orchestrator.main)
+        self.assertLess(main.index("_detect_repo()"), main.index("_record_config_baseline(repo)"))
 
 
 class TestGitConfigIsReadOnceAtStart(unittest.TestCase):
@@ -592,6 +667,7 @@ if __name__ == "__main__":
         TestAlertPathsCannotEscapeTheWorktree,
         TestRepoHooksDoNotRunOnPluginGit,
         TestFixAgentCannotRewriteGitConfig,
+        TestConfigGuardFailsClosed,
         TestGitConfigIsReadOnceAtStart,
     ]
 

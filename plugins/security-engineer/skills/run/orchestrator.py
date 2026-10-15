@@ -11,6 +11,7 @@ Usage: python3 orchestrator.py [filter_tokens] [--scan] [--dry-run] [--alert ID]
 import argparse
 import copy
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -273,62 +274,99 @@ def _remove_worktree(path: Path | None, branch: str | None = None,
                        env=git_env())
 
 
-# The effective git config of each clone, keyed by its common git dir, as first
-# seen before any fix agent in it ran. HOOKLESS_GIT overrides the keys known to
-# run commands from a hook; this catches the rest — credential.helper,
-# core.sshCommand, an include.path — which code run by a fix agent's regen or a
-# build check could write, and which the orchestrator's push would then run
-# with our credentials. Per clone rather than per alert, because the config is
-# shared by every worktree: an alert that starts after another poisoned it must
-# compare against the config from before, not adopt the poisoned one.
-_CONFIG_BASELINES: dict[str, str | None] = {}
+# The effective git config of each clone, as recorded before any repository
+# code ran in it. HOOKLESS_GIT overrides the keys known to run commands from a
+# hook; this catches the rest — credential.helper, core.sshCommand, an
+# include.path — which code run by a fix agent's regen or a build check could
+# write, and which the orchestrator's push would then run with our credentials.
+# Per clone rather than per alert, because the config is shared by every
+# worktree: an alert that starts after another poisoned it must compare against
+# the config from before, not adopt the poisoned one.
+_CONFIG_BASELINES: dict[str, str] = {}
 _CONFIG_LOCK = threading.Lock()
+_SHOW_SCOPE: list = []   # probed once: [bool]
 
 
-def _git_config_snapshot(worktree: Path) -> str | None:
-    """The effective config as git resolves it here, includes followed.
+def _supports_show_scope() -> bool:
+    """`--show-scope` is git 2.26+. Probed once, so a baseline and every later
+    check are listed the same way."""
+    with _CONFIG_LOCK:
+        if not _SHOW_SCOPE:
+            try:
+                r = subprocess.run(["git", "config", "--file", os.devnull, "--list",
+                                    "--show-scope"], capture_output=True, text=True,
+                                   timeout=30, env=git_env())
+                _SHOW_SCOPE.append(r.returncode == 0)
+            except (OSError, subprocess.TimeoutExpired):
+                _SHOW_SCOPE.append(False)
+        return _SHOW_SCOPE[0]
 
-    Values and scopes only: origins name per-worktree files, which would make
-    two worktrees of the same clone disagree about an identical config.
+
+def _git_config_snapshot(where: Path) -> str | None:
+    """The effective config as git resolves it here, includes followed, or None.
+
+    Values (and scopes, where git can show them) only: origins name per-worktree
+    files, which would make two worktrees of one clone disagree about an
+    identical config.
     """
+    cmd = ["git", "config", "--list", "--includes"]
+    if _supports_show_scope():
+        cmd.append("--show-scope")
     try:
-        r = subprocess.run(["git", "config", "--list", "--show-scope", "--includes"],
-                           cwd=worktree, capture_output=True, text=True, timeout=30,
+        r = subprocess.run(cmd, cwd=where, capture_output=True, text=True, timeout=30,
                            env=git_env())
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return r.stdout if r.returncode == 0 else None
+    return r.stdout if r.returncode == 0 and isinstance(r.stdout, str) else None
 
 
-def _config_key(worktree: Path) -> str:
-    try:
-        r = subprocess.run(["git", "rev-parse", "--path-format=absolute",
-                            "--git-common-dir"],
-                           cwd=worktree, capture_output=True, text=True, timeout=30,
-                           env=git_env())
-        if r.returncode == 0 and str(r.stdout).strip():
-            return str(r.stdout).strip()
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return str(worktree)
+def _clone_root(repo: Repository | None) -> str:
+    """The clone a repo's worktrees share, without asking git — git in a clone
+    that may already be poisoned is what this exists to avoid."""
+    root = repo.clone_path if (repo and repo.clone_path) else Path.cwd()
+    return str(Path(root).resolve())
 
 
-def _config_baseline(worktree: Path) -> str | None:
-    """Record the clone's config the first time any alert in it asks."""
-    key = _config_key(worktree)
+def _record_config_baseline(repo: Repository | None) -> str | None:
+    """The clone's config as first recorded; recorded now if it never was.
+
+    Called right after the clone (or, locally, after the repo is detected) so it
+    precedes any repository code. None when git could not list the config: the
+    caller fails closed, and nothing is cached, so it is not mistaken for a
+    baseline later.
+    """
+    key = _clone_root(repo)
     with _CONFIG_LOCK:
-        if key not in _CONFIG_BASELINES:
-            _CONFIG_BASELINES[key] = _git_config_snapshot(worktree)
-        return _CONFIG_BASELINES[key]
+        if key in _CONFIG_BASELINES:
+            return _CONFIG_BASELINES[key]
+    snapshot = _git_config_snapshot(Path(key))
+    if snapshot is None:
+        return None
+    with _CONFIG_LOCK:
+        return _CONFIG_BASELINES.setdefault(key, snapshot)
 
 
 def _config_drift(worktree: Path, baseline: str | None) -> str:
-    """A failure reason if the config no longer matches the baseline, else ""."""
-    if _git_config_snapshot(worktree) == baseline:
+    """A failure reason if the config is not provably unchanged, else ""."""
+    if baseline is None:
+        return ("no git config baseline was recorded for this clone — failing "
+                "closed rather than running git with credentials unchecked")
+    current = _git_config_snapshot(worktree)
+    if current is None:
+        return ("could not list the git config — failing closed rather than "
+                "running git with credentials unchecked")
+    if current == baseline:
         return ""
     return ("git config changed while repository code ran (fix agent or build "
             "check) — no further git command runs in this worktree with our "
             "credentials. Inspect the clone's .git/config and included files.")
+
+
+def _reset_clone_guards() -> None:
+    """Tests only: forget every baseline and the probed git capabilities."""
+    with _CONFIG_LOCK:
+        _CONFIG_BASELINES.clear()
+        _SHOW_SCOPE.clear()
 
 
 def _get_diff(worktree_path: Path) -> str:
@@ -1006,6 +1044,13 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
     """
     branch = alert_branch_name(task.alert_id)
 
+    if _record_config_baseline(repo) is None:
+        task.state = "FAILED"
+        task.failure_reason = ("could not list the clone's git config, so a change "
+                               "made by repository code could not be detected — "
+                               "failing closed")
+        return task
+
     try:
         task.worktree_path = _create_worktree(task.alert_id, branch, repo=repo)
     except WorktreeConflict as e:
@@ -1060,7 +1105,7 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     notifier.notify("fix_started", p)
 
     pipeline = get_pipeline(task.feature_type, timeouts=TIMEOUTS)
-    config_baseline = _config_baseline(task.worktree_path)
+    config_baseline = _record_config_baseline(repo)
 
     def config_drifted(event: str) -> bool:
         reason = _config_drift(task.worktree_path, config_baseline)
@@ -1773,6 +1818,9 @@ def _run_repo_pipeline(repo: Repository, args) -> dict:
     p = _repo_notif(repo)
     p.detail = str(repo.clone_path)
     notifier.notify("clone_succeeded", p)
+    # Before any repository code runs in this clone. run_one fails closed for
+    # every alert here if this could not be recorded.
+    _record_config_baseline(repo)
 
     try:
         local_args = copy.copy(args)
@@ -1970,6 +2018,7 @@ def main(argv=None):
     if not repo:
         sys.exit("Error: could not detect repo from git remote. "
                  "Run from inside a git repo or use --remote owner/repo.")
+    _record_config_baseline(repo)
 
     notifier = build_notifiers(repo.name, Path.cwd())
 

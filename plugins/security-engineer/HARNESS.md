@@ -346,12 +346,16 @@ git 2.54+) that `core.hooksPath` never reaches. Commit and push add
 The second catches what no override list can enumerate. `credential.helper`,
 `core.sshCommand`, an `include.path`, diff and filter drivers — any of these
 written by repository code would run inside the orchestrator's push with our
-credentials. So the clone's effective config (`git config --list --includes`)
-is recorded before the first fix agent in it runs, and compared after every
+credentials. So the clone's effective config (`git config --list --includes`,
+plus `--show-scope` where the installed git has it — probed once, so baseline
+and checks are listed alike) is recorded right after the clone, or locally right
+after the repository is detected, before any repository code runs. It is keyed
+by the clone's path, worked out without running git. It is compared after every
 fix-agent run and again before every commit or push, since the build check in
 between executes repository code too. Any difference fails the alert — and,
 because the baseline is per clone, every later alert in that clone — before the
-next git command. What it cannot see is a change made and reverted between two
+next git command. Not being able to tell fails too: if the config cannot be
+listed, for the baseline or for a check, the alert fails closed. What it cannot see is a change made and reverted between two
 checks, or one outside git's config (a `~/.ssh/config` edit, say).
 
 The operator's own git configuration is read once, at the start of a run.

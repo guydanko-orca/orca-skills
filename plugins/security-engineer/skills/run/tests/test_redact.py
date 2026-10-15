@@ -34,7 +34,7 @@ sys.path.insert(0, str(_DIR.parent))                 # skills/run/
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # skills/lib/
 
 sys.path.insert(0, str(_DIR))                        # tests/
-import _git_sandbox  # noqa: F401  (hermetic git config snapshot)
+import _git_sandbox  # (hermetic git config snapshot)
 import impact_agent
 import orchestrator
 import validator
@@ -765,6 +765,14 @@ class TestRunSummary(unittest.TestCase):
             orchestrator._print_plan([task], [], [], [], "o/r", dry_run=False)
         self.assertNotIn(SECRET, out.getvalue())
 
+
+
+def setUpModule():
+    _git_sandbox.steady_git_config()
+
+
+def tearDownModule():
+    _git_sandbox.release_git_config()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
