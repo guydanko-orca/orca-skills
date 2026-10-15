@@ -7,7 +7,9 @@ one of them fixed alone leaves the path open, so they are tested together.
 
 Run with: python3 tests/test_untrusted.py
 """
+import contextlib
 import inspect
+import io
 import os
 import sys
 import tempfile
@@ -404,6 +406,28 @@ class TestAgentEnv(unittest.TestCase):
             env = agent_env(shaped)
             for name in shaped:
                 self.assertNotIn(name, env, name)
+
+    def test_key_auth_and_dsn_names_are_refused(self):
+        """OPENAI_API_KEY slipped past TOKEN|SECRET|PASSWORD and reached build
+        children, which run repository code."""
+        shaped = ["OPENAI_API_KEY", "STRIPE_KEY", "BASIC_AUTH_HEADER", "SENTRY_DSN"]
+        with patch.dict(os.environ, dict.fromkeys(shaped, "x")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            env, built = agent_env(shaped), build_env(shaped)
+        for name in shaped:
+            with self.subTest(name):
+                self.assertNotIn(name, env)
+                self.assertNotIn(name, built)
+
+    def test_documented_extra_env_examples_still_pass(self):
+        """config.example.yaml and config.py name these as legitimate uses."""
+        documented = ["AWS_REGION", "AWS_PROFILE", "GOPROXY", "GOPRIVATE",
+                      "NPM_CONFIG_REGISTRY", "PIP_INDEX_URL"]
+        with patch.dict(os.environ, dict.fromkeys(documented, "x")):
+            env = agent_env(documented)
+        for name in documented:
+            with self.subTest(name):
+                self.assertIn(name, env)
 
     def test_credential_carrying_urls_are_not_allowed_by_default(self):
         """GOPROXY and friends can embed credentials; opt in, never default."""

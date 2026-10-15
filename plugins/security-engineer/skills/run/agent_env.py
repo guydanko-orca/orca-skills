@@ -96,8 +96,13 @@ HOOKLESS_GIT = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=f
                 *(arg for event in _HOOK_EVENTS
                   for arg in ("-c", f"hook.{event}.enabled=false"))]
 
-_NEVER_SHAPE = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|SESSION",
-                              re.IGNORECASE)
+# KEY, AUTH and DSN: OPENAI_API_KEY, BASIC_AUTH_HEADER and SENTRY_DSN carry a
+# credential under none of the other words. None of the documented extra_env
+# uses (AWS_REGION, AWS_PROFILE, GOPROXY, GOPRIVATE, NPM_CONFIG_REGISTRY,
+# PIP_INDEX_URL) contains one.
+_NEVER_SHAPE = re.compile(
+    r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|SESSION|KEY|AUTH|DSN",
+    re.IGNORECASE)
 
 
 def agent_env(extra: list | None = None) -> dict:
