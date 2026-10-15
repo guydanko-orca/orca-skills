@@ -104,6 +104,12 @@ MASKED_SNIPPETS = [
     ("fully starred",           ['password: "**************"']),
     ("bullet mask",             ['TOKEN = "••••••••••"']),
     ("redacted marker",         ['API_KEY = "[REDACTED]"']),
+    ("trailing dots",           ['GITHUB_TOKEN = "ghp_ab12...."']),
+    ("ellipsis",                ['aws_key = "AKIA12345…"']),
+    ("x-run",                   ['STRIPE_KEY = "sk-xxxxx12345"']),
+    ("hash run",                ['DB_PASSWORD = "################"']),
+    ("angle placeholder",       ['SLACK_TOKEN = "<hidden-value>"']),
+    ("ordinary-looking value",  ['DB_PASS = "correcthorse"']),
     ("no snippet at all",       []),
     ("only a short value",      ['x = "ab"']),
 ]
@@ -198,6 +204,13 @@ class TestMaskedSnippetFallsBackToPatterns(unittest.TestCase):
     def test_fallback_reason_carries_no_snippet_content(self):
         r = build_redactor(self._alert(['API_KEY = "sk-li****"']))
         self.assertNotIn("sk-li", r.fallback_reason)
+
+    def test_angle_brackets_in_code_are_not_a_mask(self):
+        """Only a value that is a placeholder counts; generics on the line do not."""
+        alert = self._alert([f'Map<String, String> env = Map.of("API_KEY", "{SECRET}");'])
+        r = build_redactor(alert)
+        self.assertIsNone(r.fallback_reason)
+        self.assertIn(SECRET, r.candidates)
 
     def test_a_usable_snippet_needs_no_fallback(self):
         r = build_redactor(SECRET_ALERT)

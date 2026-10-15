@@ -89,9 +89,16 @@ SECRET_PATTERNS = [
 ]
 _COMPILED_PATTERNS = [re.compile(p) for p in SECRET_PATTERNS]
 
-# A masked value: runs of `*` or `•`, an x-run, or a redaction marker. A
-# candidate containing one of these matches nothing in real text.
-_MASKED = re.compile(r"\*{3,}|•{3,}|(?i:x{6,})|(?i:redacted|masked)")
+# A masked line: star or bullet runs, or a redaction marker. Kept narrow, since
+# a whole source line legitimately holds `...`, `<T>` or a `----` banner.
+_MASKED = re.compile(r"\*{3,}|•{3,}|(?i:redacted|masked)")
+# A masked value is judged more broadly — it is meant to be the credential, so
+# any of these means it is not: a run of one punctuation character (`....`,
+# `####`), an ellipsis, an x-run, a marker word, or a whole-value placeholder
+# such as `<hidden-value>`. A candidate like this matches nothing in real text.
+_MASKED_VALUE = re.compile(
+    r"([^A-Za-z0-9\s])\1{3,}|\*{3,}|•{3,}|\.{3}|…|(?i:x{4,})"
+    r"|(?i:redacted|masked|hidden)|^<[^<>]*>$")
 
 # A run long enough to be a key and drawn from the alphabets keys use. Shorter
 # than 20 it starts matching words; a fence tag (`/untrusted-` plus an 8-hex
@@ -136,12 +143,18 @@ def _candidates(alert: dict) -> tuple[list[str], bool]:
     reverse order would leave the line's surrounding text intact and correct.
 
     Masked strings are dropped: they cannot match anything real, and keeping one
-    made the redactor look armed while it scrubbed nothing.
+    made the redactor look armed while it scrubbed nothing. A value only counts
+    as found when it is shaped like a credential — a SECRET_PATTERNS value or a
+    random-looking token. Anything else is still scrubbed exactly, but cannot be
+    trusted to be the credential, so the caller falls back to patterns as well.
     """
     values: set[str] = set()
     lines: set[str] = set()
+    shaped: set[str] = set()
 
     for line in _snippet_lines(alert):
+        for pattern in _COMPILED_PATTERNS:
+            shaped.update(m.group("value") for m in pattern.finditer(line))
         for _key, value in _ASSIGNMENT.findall(line):
             if len(value) >= _MIN_VALUE_LEN:
                 values.add(value)
@@ -153,13 +166,20 @@ def _candidates(alert: dict) -> tuple[list[str], bool]:
         if len(line) >= _MIN_LINE_LEN:
             lines.add(line)
 
-    usable_values = {v for v in values if not _MASKED.search(v)}
-    found = usable_values | {ln for ln in lines if not _MASKED.search(ln)}
-    return sorted(found, key=len, reverse=True), bool(usable_values)
+    unmasked = {v for v in values if not _MASKED_VALUE.search(v)}
+    confirmed = {v for v in unmasked if v in shaped or _looks_random(v)}
+    found = unmasked | {ln for ln in lines if not _MASKED.search(ln)}
+    return sorted(found, key=len, reverse=True), bool(confirmed)
 
 
 def _looks_masked(alert: dict) -> bool:
-    return any(_MASKED.search(line) for line in _snippet_lines(alert))
+    lines = _snippet_lines(alert)
+    if any(_MASKED.search(line) for line in lines):
+        return True
+    return any(_MASKED_VALUE.search(value)
+               for line in lines
+               for value in [*(v for _k, v in _ASSIGNMENT.findall(line)),
+                             *_QUOTED.findall(line)])
 
 
 def _entropy(token: str) -> float:

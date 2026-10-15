@@ -432,9 +432,11 @@ blind gate 2 to the lines it has to judge.
 All of that assumes the snippet carries the credential verbatim. Whether Orca
 ever returns it masked could not be checked here — no fixture or test in this
 repository shows a secret alert's snippet, and Orca's public docs do not say —
-so the redactor is built to be safe either way. A masked string (`sk-****`,
+so the redactor is built to be safe either way. A masked value (`sk-****`,
+`ghp_ab12....`, `AKIA12345…`, `sk-xxxxx12345`, `####`, `<hidden-value>`,
 `[REDACTED]`) is never a candidate, since it matches nothing real. If the
-snippet looks masked or yields no value at all, a secret finding's redactor
+snippet looks masked, or yields no value shaped like a credential — one a
+secret pattern captures or that looks random — a secret finding's redactor
 falls back to redacting by shape on every egress path: the sanity gate's own
 `SECRET_PATTERNS` (one list, shared, value group only so keys survive) plus a
 random-token check. That check judges each separator-free part of a 20+
