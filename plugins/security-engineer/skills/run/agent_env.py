@@ -356,8 +356,35 @@ def _exited(proc) -> bool:
     return proc.poll() is not None
 
 
+_repo_code = threading.local()
+
+
+@contextlib.contextmanager
+def repo_code_guard(hold):
+    """Make every run_in_group call on this thread run inside `hold()`.
+
+    The orchestrator installs its clone gate's shared hold here, so repository
+    code holds the gate exactly while it runs: the hold ends when the process
+    group is dead, and whatever happens to the output afterwards — redaction of
+    build output, above all — does not keep a push waiting.
+    """
+    previous = getattr(_repo_code, "hold", None)
+    _repo_code.hold = hold
+    try:
+        yield
+    finally:
+        _repo_code.hold = previous
+
+
 def run_in_group(cmd, *, input=None, timeout=None, cwd=None, env=None
                  ) -> subprocess.CompletedProcess:
+    hold = getattr(_repo_code, "hold", None)
+    with hold() if hold else contextlib.nullcontext():
+        return _run_in_group(cmd, input=input, timeout=timeout, cwd=cwd, env=env)
+
+
+def _run_in_group(cmd, *, input=None, timeout=None, cwd=None, env=None
+                  ) -> subprocess.CompletedProcess:
     """subprocess.run for the processes that run repository code — the fix
     agent, whose Bash runs lockfile regens, and the build checks.
 

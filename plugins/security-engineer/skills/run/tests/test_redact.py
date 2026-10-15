@@ -399,6 +399,99 @@ class TestEntropyHeuristicRates(unittest.TestCase):
             f"+++ b/{path}"), "without the alert naming it, it does look random")
 
 
+class TestRedactionTimeIsBounded(unittest.TestCase):
+    """Everything the fallback scrubs — diffs, prompts, build output, model prose —
+    and the snippet it derives candidates from can be attacker-written. Shapes
+    that do not end at `$` defeated lookahead-anchored patterns: `"a=" * N + "."`
+    took 68 s at 100 KB. Each case runs in a child process with a hard timeout,
+    so a regression fails instead of hanging the suite."""
+
+    SHAPES = {
+        "assign-then-dot": '"a=" * {n} + "."',
+        "hyphen-run": '"a-" * {n}',
+        "key-equals": '"KEY=" * {n} + "x"',
+        "hex-run": '"0123456789abcdef" * ({n} // 8)',
+        "equals-run": '"=" * ({n} * 2)',
+        "dash-run": '"-" * ({n} * 2)',
+        "quote-run": '"token=\'" * ({n} // 3)',
+        # 40-hex tokens: each one asks for its line's digest context.
+        "digest-line": '("0123456789abcdef" * 2 + "01234567 ") * ({n} // 20)',
+    }
+
+    def _elapsed(self, setup, call, n):
+        import subprocess
+        code = (
+            "import sys, time\n"
+            f"sys.path[:0] = [{str(_DIR.parent)!r}, {str(_DIR.parent.parent / 'lib')!r}]\n"
+            "import redact\n"
+            f"{setup}\n"
+            f"text = {self.SHAPES_EXPR.format(n=n)}\n"
+            "started = time.monotonic()\n"
+            f"{call}\n"
+            "print(time.monotonic() - started)\n")
+        result = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True,
+                                text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr[-500:])
+        return float(result.stdout.strip())
+
+    def _check(self, setup, call):
+        import subprocess
+        for name, expr in self.SHAPES.items():
+            for size in (100_000, 1_000_000):
+                with self.subTest(shape=name, size=size):
+                    self.SHAPES_EXPR = expr
+                    try:
+                        took = self._elapsed(setup, call, size // 2)
+                    except subprocess.TimeoutExpired:
+                        self.fail(f"{name} at {size} bytes ran past 20 s")
+                    self.assertLess(took, 1.0, f"{name} at {size} bytes")
+
+    def test_scrubbing_a_hostile_text(self):
+        self._check(
+            "r = redact.build_redactor({'feature_type': 'secret', 'category': 'Secrets', "
+            "'code_snippet': []})",
+            "r(text)")
+
+    def test_deriving_candidates_from_a_hostile_snippet(self):
+        self._check("", "redact.build_redactor({'feature_type': 'secret', "
+                        "'category': 'Secrets', 'code_snippet': [text]})")
+
+    def test_the_sanity_gate_on_a_hostile_added_line(self):
+        self._check("import re", "[re.search(p, '+' + text) for p in redact.SECRET_PATTERNS]")
+
+
+class TestOversizedTextFailsClosed(unittest.TestCase):
+    """Past the cap the fallback does not scan, and it does not pass text
+    through unscanned either: the rest is withheld, marked as such."""
+
+    def test_the_tail_is_withheld_not_passed_through(self):
+        import redact
+        r = build_redactor(dict(SECRET_ALERT, code_snippet=[]))
+        tail_secret = "tail" + hashlib.sha256(b"tail").hexdigest()
+        text = "x " * (redact.REDACT_LIMIT // 2) + f"KEY={tail_secret}\n"
+        out = r(text)
+        self.assertNotIn(tail_secret, out)
+        self.assertIn("withheld", out)
+        self.assertLessEqual(len(out), redact.REDACT_LIMIT + 200)
+
+    def test_a_token_cut_by_the_cap_is_withheld_whole(self):
+        import redact
+        r = build_redactor(dict(SECRET_ALERT, code_snippet=[]))
+        secret = base64.b64encode(hashlib.sha512(b"straddle").digest()).decode()
+        text = "x " * ((redact.REDACT_LIMIT - 20) // 2) + secret + " end"
+        self.assertNotIn(secret[:12], r(text))
+
+    def test_text_under_the_cap_is_unchanged_in_length_class(self):
+        r = build_redactor(dict(SECRET_ALERT, code_snippet=[]))
+        self.assertEqual(r("plain words here"), "plain words here")
+
+    def test_an_oversized_snippet_line_is_not_trusted_as_a_candidate_source(self):
+        import redact
+        alert = dict(SECRET_ALERT, code_snippet=[f'API_KEY = "{SECRET}"  # ' + "x" * 10000])
+        self.assertTrue(build_redactor(alert).fallback_reason)
+        self.assertTrue(redact.MAX_SNIPPET_LINE < 10000)
+
+
 class TestRedactBeforeTruncate(unittest.TestCase):
     """Slicing first can cut an echoed credential mid-value, leaving a prefix
     that no exact candidate matches. Every capped echo redacts, then cuts."""

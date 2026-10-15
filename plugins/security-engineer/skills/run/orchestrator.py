@@ -35,6 +35,7 @@ from agent_env import (
     git_env,
     neutral_dir,
     push_git,
+    repo_code_guard,
     run_env,
     run_in_group,
 )
@@ -1168,7 +1169,10 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
             _rebaseline(repo)
 
     try:
-        return _run_pipeline(task, dry_run, notifier, repo)
+        # Repository code — the fix agent, the build checks — runs only through
+        # run_in_group, which holds this gate shared for exactly that long.
+        with repo_code_guard(gate.shared):
+            return _run_pipeline(task, dry_run, notifier, repo)
     finally:
         _teardown(task, branch, repo, gate)
 
@@ -1288,8 +1292,7 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
 
     while task.attempts < MAX_RETRIES:
         task.attempts += 1
-        with gate.shared():
-            fix_result = _invoke_fix_agent(task, dry_run, timeout)
+        fix_result = _invoke_fix_agent(task, dry_run, timeout)
         # Before anything else runs git here, _revert included.
         if not checked("fix_failed")[0]:
             return task
@@ -1377,8 +1380,7 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     # local_build_check dispatches on file extension and a manifest bump is .txt,
     # .mod or .json.
     print(f"[PHASE] {task.alert_id} {task.feature_type} verification", flush=True)
-    with gate.shared():
-        local_val = pipeline.verify(task, task.worktree_path, plan)
+    local_val = pipeline.verify(task, task.worktree_path, plan)
     if not local_val.passed:
         task.state = "FAILED"
         task.failure_reason = "; ".join(local_val.failures)
@@ -1471,9 +1473,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                                 "retry was abandoned, so the branch still carries "
                                 "the fix the check failed")
                 timeout = pipeline.timeout_sec
-                with gate.shared():
-                    fix_result = _invoke_fix_agent(task, dry_run, timeout,
-                                                   feedback=orca_feedback)
+                fix_result = _invoke_fix_agent(task, dry_run, timeout,
+                                               feedback=orca_feedback)
                 if not checked("fix_failed")[0]:
                     return task
                 if not fix_result.success:
@@ -1506,8 +1507,7 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                     notifier.notify("validation_failed", p)
                     return task
 
-                with gate.shared():
-                    build2 = pipeline.verify(task, task.worktree_path, plan)
+                build2 = pipeline.verify(task, task.worktree_path, plan)
                 if not build2.passed:
                     task.state = "FAILED"
                     task.failure_reason = "; ".join(build2.failures)

@@ -492,10 +492,10 @@ class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
         the config unchanged first."""
         import re
         src = __import__("inspect").getsource(orchestrator._run_pipeline)
-        for call in ("_invoke_fix_agent(", "pipeline.verify("):
-            for m in re.finditer(re.escape(call), src):
-                with self.subTest(call=call, at=m.start()):
-                    self.assertIn("with gate.shared():", src[max(0, m.start() - 80):m.start()])
+        run_one = __import__("inspect").getsource(orchestrator.run_one)
+        self.assertIn("with repo_code_guard(gate.shared):", run_one)
+        self.assertLess(run_one.index("repo_code_guard(gate.shared)"),
+                        run_one.index("_run_pipeline(task"))
         for step in ("_revert(task.worktree_path)", "worktree_diff(task.worktree_path)",
                      "_get_diff(task.worktree_path)", "_commit_and_pr(task",
                      "_push_fix_update(task)"):
@@ -850,6 +850,36 @@ class TestCloneGate(unittest.TestCase):
         self.assertEqual(events, ["push", "late agent"])
 
 
+class TestRepositoryCodeHoldsTheGateOnlyWhileItRuns(unittest.TestCase):
+    """Build output can be large and hostile; redacting it must not keep a push
+    waiting. The shared hold is taken by run_in_group around the process only."""
+
+    def test_build_output_is_redacted_after_the_hold_ends(self):
+        import contextlib
+        events = []
+
+        @contextlib.contextmanager
+        def hold():
+            events.append("hold")
+            yield
+            events.append("release")
+
+        class Recorder:
+            def __call__(self, text):
+                events.append("redact")
+                return text
+
+        with tempfile.TemporaryDirectory() as d, agent_env.repo_code_guard(hold):
+            result = validator._run_check(
+                [sys.executable, "-c", "import sys; sys.stderr.write('boom'); sys.exit(1)"],
+                Path(d), redactor=Recorder())
+        self.assertFalse(result.passed)
+        self.assertEqual(events, ["hold", "release", "redact"])
+
+    def test_without_a_guard_nothing_is_held(self):
+        self.assertEqual(agent_env.run_in_group(["sh", "-c", "exit 0"]).returncode, 0)
+
+
 class TestPoisonedCloneRunsNoMoreGit(unittest.TestCase):
     """Once a check finds the config changed, nothing else in that clone runs
     git: not the failing alert's teardown, not a later alert's worktree."""
@@ -1132,6 +1162,7 @@ if __name__ == "__main__":
         TestPlantedGitCommandsGetNoCredentials,
         TestPluginGitDoesNotPoisonItsOwnClone,
         TestCloneGate,
+        TestRepositoryCodeHoldsTheGateOnlyWhileItRuns,
         TestPoisonedCloneRunsNoMoreGit,
         TestRepositoryCodeDoesNotOutliveItsRun,
         TestConfigGuardFailsClosed,

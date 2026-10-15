@@ -63,17 +63,27 @@ PLACEHOLDER = "[REDACTED-SECRET]"
 _MIN_VALUE_LEN = 6
 _MIN_LINE_LEN = 8
 
+# Every pattern here runs over text an attacker can write. Names are bounded
+# and anchored at their start, so a long run of name characters is one match
+# attempt, not one per character, each scanning to the end of the run.
+
 # The right-hand side of an assignment: `API_KEY = "sk-live-abc"`, `password: 'hunter2'`.
 # Only group 2 (the value) is ever taken — see the module docstring on keys.
-_ASSIGNMENT = re.compile(r"""([A-Za-z_][\w.\-]*)\s*[=:]\s*["']([^"']+)["']""")
+_ASSIGNMENT = re.compile(
+    r"""(?<![\w.\-])([A-Za-z_][\w.\-]{0,63})[ \t]*[=:][ \t]*["']([^"'\n]{1,1024})["']""")
 
 # Bare quoted literals, for snippets that are not shaped like an assignment
 # (a call argument, a YAML scalar, a JSON value).
-_QUOTED = re.compile(r"""["']([^"']+)["']""")
+_QUOTED = re.compile(r"""["']([^"'\n]{1,1024})["']""")
 
 # Unquoted `KEY=value`, the .env and Dockerfile `ENV` form, where there are no
 # quotes to anchor on. Stops at whitespace so a trailing comment is not absorbed.
-_BARE_ASSIGNMENT = re.compile(r"""([A-Za-z_][\w.\-]*)\s*=\s*([^\s"'#]{12,})""")
+_BARE_ASSIGNMENT = re.compile(
+    r"""(?<![\w.\-])([A-Za-z_][\w.\-]{0,63})[ \t]*=[ \t]*([^\s"'#]{12,})""")
+
+# A snippet line longer than this is not a line of configuration, and scanning
+# it is the cost. Its presence makes the snippet untrusted as a candidate source.
+MAX_SNIPPET_LINE = 4096
 
 # Credential shapes, shared with validator.sanity_check, which fails a diff that
 # adds a line matching any of them. The `value` group is what the fallback
@@ -132,10 +142,14 @@ _DIGEST_CONTEXT = re.compile(
 # a credential word afterwards in Python. Expressing that word inside the regex
 # put two unbounded runs around an alternation, and a long hyphenated line took
 # minutes to scan — attacker-written diff context, before any bound.
-_UNQUOTED_ASSIGNMENT = re.compile(
-    r"(?<![\w-])(?P<key>[\w-]{1,64})[ \t]*[=:][ \t]*"
-    r"(?P<value>[^\s\"'#,;()\[\]{}$.]{8,})(?=[\s\"'#,;]|$)",
-    re.MULTILINE)
+#
+# Scanned by hand rather than with a lookahead: `"a=" * N + "."` made the value
+# backtrack to every shorter length at every `=`, 68 s at 100 KB. The key is
+# found by a bounded, start-anchored pattern; the value is then the one maximal
+# run of value characters after it, and scanning resumes past that run.
+_ASSIGNMENT_KEY = re.compile(r"(?<![\w-])(?P<key>[\w-]{1,64})[ \t]*[=:][ \t]*")
+_VALUE_RUN = re.compile(r"[^\s\"'#,;()\[\]{}$.]*")
+_VALUE_END = frozenset(" \t\r\n\"'#,;")
 _CREDENTIAL_NAME = re.compile(r"(?i)key|secret|token|passw(?:or)?d|pwd|auth|credential")
 _SRI = re.compile(r"sha(?:1|256|384|512)-")
 
@@ -147,11 +161,20 @@ FALLBACK_REASON = (
     "model prompts, the PR body or the notifications.")
 
 
-def _snippet_lines(alert: dict) -> list[str]:
-    """The alert's code_snippet as a list of lines, however Orca shaped it."""
+def _raw_snippet_lines(alert: dict) -> list[str]:
     raw = alert.get("code_snippet") or []
     lines = [str(item) for item in raw] if isinstance(raw, list) else str(raw).splitlines()
     return [ln.strip() for ln in lines if ln and ln.strip()]
+
+
+def _snippet_lines(alert: dict) -> list[str]:
+    """The alert's code_snippet as a list of lines, however Orca shaped it —
+    without any line too long to be configuration."""
+    return [ln for ln in _raw_snippet_lines(alert) if len(ln) <= MAX_SNIPPET_LINE]
+
+
+def _snippet_oversized(alert: dict) -> bool:
+    return any(len(ln) > MAX_SNIPPET_LINE for ln in _raw_snippet_lines(alert))
 
 
 def _candidates(alert: dict) -> tuple[list[str], bool]:
@@ -208,11 +231,13 @@ def _entropy(token: str) -> float:
     return -sum(n / len(token) * math.log2(n / len(token)) for n in counts.values())
 
 
-def _part_looks_random(part: str, digest_context: bool = False) -> bool:
+def _part_looks_random(part: str, digest_context=False) -> bool:
+    """digest_context: a bool, or a callable asked only when it matters."""
     if len(part) < _MIN_PART:
         return False
     if re.fullmatch(r"[0-9a-fA-F]+", part):
-        if digest_context and len(part) in _DIGEST_LENGTHS:
+        if len(part) in _DIGEST_LENGTHS and (
+                digest_context() if callable(digest_context) else digest_context):
             return False
         return (bool(re.search(r"[0-9]", part)) and bool(re.search(r"[a-fA-F]", part))
                 and _entropy(part) >= _HEX_MIN_ENTROPY)
@@ -227,16 +252,25 @@ def _part_looks_random(part: str, digest_context: bool = False) -> bool:
 
 
 def _looks_random(token: str, keep: frozenset = frozenset(),
-                  digest_context: bool = False) -> bool:
+                  digest_context=False) -> bool:
     if _SRI.match(token):
         return False
     return any(_part_looks_random(part, digest_context) for part in _PART_SEP.split(token)
                if part not in keep)
 
 
+_CONTEXT_WINDOW = 256
+
+
 def _in_digest_context(m) -> bool:
-    """Does the line say the token at m is a SHA or a checksum?"""
-    before = m.string[max(0, m.string.rfind("\n", 0, m.start()) + 1):m.start()]
+    """Does the line say the token at m is a SHA or a checksum?
+
+    Only the last _CONTEXT_WINDOW characters before it are read: reading back to
+    the start of the line for every token made one long line of tokens quadratic.
+    """
+    window_start = max(0, m.start() - _CONTEXT_WINDOW)
+    newline = m.string.rfind("\n", window_start, m.start())
+    before = m.string[max(window_start, newline + 1):m.start()]
     return before.endswith(("@", "#")) or bool(_DIGEST_CONTEXT.search(before))
 
 
@@ -252,18 +286,52 @@ def _scrub_patterns(text: str, keep: frozenset = frozenset()) -> str:
 
     for pattern in _COMPILED_PATTERNS:
         text = pattern.sub(value_only, text)
-    text = _UNQUOTED_ASSIGNMENT.sub(
-        lambda m: value_only(m) if _CREDENTIAL_NAME.search(m.group("key")) else m.group(),
-        text)
+    text = _scrub_unquoted_assignments(text)
     return _TOKEN.sub(lambda m: PLACEHOLDER
-                      if _looks_random(m.group(), keep, _in_digest_context(m))
+                      if _looks_random(m.group(), keep, lambda: _in_digest_context(m))
                       else m.group(), text)
+
+
+def _scrub_unquoted_assignments(text: str) -> str:
+    out, last, pos = [], 0, 0
+    while True:
+        key = _ASSIGNMENT_KEY.search(text, pos)
+        if key is None:
+            break
+        run = _VALUE_RUN.match(text, key.end())
+        start, end = run.span()
+        if (end - start >= 8 and (end == len(text) or text[end] in _VALUE_END)
+                and _CREDENTIAL_NAME.search(key.group("key"))):
+            out += [text[last:start], PLACEHOLDER]
+            last = end
+        pos = max(end, key.end(), key.start() + 1)
+    out.append(text[last:])
+    return "".join(out)
 
 
 def _path_tokens(alert: dict) -> frozenset:
     paths = " ".join(str(alert.get(k) or "") for k in ("file_path", "source"))
     return frozenset(part for token in _TOKEN.findall(paths)
                      for part in _PART_SEP.split(token))
+
+
+# The most a pattern scan reads in one call. Past it the text is withheld, not
+# scanned and not passed through: a scan that cannot finish must not turn into
+# text that leaves unscanned.
+REDACT_LIMIT = 128 * 1024
+
+
+def _capped(text: str) -> tuple[str, str]:
+    """(head to scan, marker for what was withheld). The cut moves back to a
+    whitespace boundary, so a token straddling it is withheld whole rather than
+    half-scanned — half a key no longer looks like a key."""
+    if len(text) <= REDACT_LIMIT:
+        return text, ""
+    cut = REDACT_LIMIT
+    while cut > 0 and not text[cut - 1].isspace():
+        cut -= 1
+    return text[:cut], (f"\n{PLACEHOLDER} {len(text) - cut} characters withheld: "
+                        "past the redaction limit\n")
 
 
 class Redactor:
@@ -293,7 +361,8 @@ class Redactor:
             if candidate in text:
                 text = text.replace(candidate, PLACEHOLDER)
         if self.fallback_reason:
-            text = _scrub_patterns(text, self.keep)
+            text, withheld = _capped(text)
+            text = _scrub_patterns(text, self.keep) + withheld
         return text
 
     def scrub(self, value):
@@ -330,6 +399,6 @@ def build_redactor(alert: dict | None) -> Redactor:
     if _resolve_feature_type(alert) != "secret":
         return _NULL_REDACTOR
     candidates, has_value = _candidates(alert)
-    if has_value and not _looks_masked(alert):
+    if has_value and not _looks_masked(alert) and not _snippet_oversized(alert):
         return Redactor(candidates)
     return Redactor(candidates, fallback_reason=FALLBACK_REASON, keep=_path_tokens(alert))

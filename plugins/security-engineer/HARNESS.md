@@ -388,7 +388,9 @@ a check, the alert fails closed.
 Up to four alerts share one clone, so a check is only worth something if
 nothing can change the config between it and the git call it guards. Each clone
 has a reader/writer gate (`orchestrator._CloneGate`): fix agents and build
-checks run holding it shared, and every check together with the git that
+checks hold it shared — `run_in_group` takes the hold around the process and
+drops it when the group is dead, so redacting their output does not hold up a
+push — and every check together with the git that
 follows it — the push included — holds it exclusively, so no agent of another
 alert runs in that window. A waiting writer blocks new readers, so a stream of
 agents cannot starve a push. A detected change poisons the clone. The alert
@@ -520,7 +522,20 @@ values each: `-KEY=<hex>` 100% at every length from 8 to 64; bare hex in prose
 97% at 20, 100% at 32, 40 and 64, but 0% below 20 characters. On 1000 random
 strings, 82% of 20-character and ~95% of 32-character base64 caught. Paths,
 names and SHAs in diff headers and lockfiles are left alone. Over-redaction is
-the accepted failure here; under-redaction is not. Shapes can miss a credential, so the alert is also flagged
+the accepted failure here; under-redaction is not.
+
+All of this runs over text an attacker can write, so its cost is bounded too.
+Names are matched by bounded, start-anchored patterns; the unquoted `KEY=value`
+form is scanned by hand rather than with a lookahead, after `"a=" * N + "."`
+took 68 s at 100 KB; the digest-context look-back reads at most 256 characters.
+Tests drive eight hostile shapes at 100 KB and 1 MB through the redactor,
+candidate extraction and the sanity gate's patterns, in a child process with a
+hard timeout, and require each to finish in under a second. A fallback scan also
+reads at most `REDACT_LIMIT` (128 KB) per call. Past that the text is withheld,
+replaced by a marker saying so — never passed through unscanned — and the cut
+moves back to whitespace so no token is scanned half. A snippet line over
+4,096 characters is not used for candidates, and its presence sends the alert
+to the fallback. Shapes can miss a credential, so the alert is also flagged
 `needs-review` with that reason in the PR body, before the fix agent runs.
 
 ## Degradation policy
