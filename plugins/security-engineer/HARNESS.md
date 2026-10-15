@@ -410,7 +410,12 @@ hold that ran only plugin git, the config is compared again and one change is
 accepted: git-lfs adding `lfs.<url>.access` or `lfs.<url>.locksverify` on first
 push. Any other difference — a removed line, any other key — poisons the clone.
 Fix agents and build checks also run in their own process group, killed in full
-when the command exits or times out. A child left in the background therefore
+when the command exits or times out. The deadline starts before their stdin is
+written, so a child that never reads its stdin cannot stall the write.
+Each output stream is kept up to 5 MB, and the rest is dropped and counted.
+Output is decoded with replacement, so invalid UTF-8 cannot empty it. Push,
+clone and gh calls have timeouts, since several run while a clone is held
+exclusively. A child left in the background therefore
 cannot rewrite the config after the last check. A child that leaves the group
 itself — with `setsid()`, or with `setpgid()` alone — is not caught.
 

@@ -167,12 +167,21 @@ class AlertTask:
 # ---------------------------------------------------------------------------
 
 def _run(cmd: list[str], check: bool = True, cwd: Path | None = None,
-         env: dict | None = None) -> tuple[str, str, int]:
+         env: dict | None = None, timeout: float | None = 600) -> tuple[str, str, int]:
     """env defaults to run_env(): everything, for run_agent.py's Orca calls, but
     reading the plugin's snapshot of the global git config, never ~/.gitconfig.
-    Git and gh callers pass git_env() or credentialed_env() instead."""
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd,
-                       env=env if env is not None else run_env())
+    Git and gh callers pass git_env() or credentialed_env() instead.
+
+    timeout: several callers hold a clone's gate exclusively, so a hung push or
+    gh call would stall every alert in that clone. Expiry is a RuntimeError,
+    which every caller already treats as the step failing.
+    """
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout,
+                           env=env if env is not None else run_env())
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"timed out after {timeout}s: "
+                           f"{' '.join(str(c) for c in cmd[:3])}") from e
     if check and r.returncode != 0:
         # Fall back to stdout before giving up on a message. run_agent.py reports
         # failures as JSON on stdout ({"error": "Alert … not found"}) and writes
@@ -910,11 +919,16 @@ def _ensure_label(owner_repo: str, label: str) -> None:
     carries the reason whether or not either succeeds.
     """
     color, description = _LABEL_SPECS.get(label, _DEFAULT_LABEL_SPEC)
-    r = subprocess.run(
-        ["gh", "label", "create", label, "--repo", owner_repo,
-         "--color", color, "--description", description, "--force"],
-        capture_output=True, text=True, env=credentialed_env(), cwd=neutral_dir(),
-    )
+    try:
+        r = subprocess.run(
+            ["gh", "label", "create", label, "--repo", owner_repo,
+             "--color", color, "--description", description, "--force"],
+            capture_output=True, text=True, env=credentialed_env(), cwd=neutral_dir(),
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"[WARN] gh timed out creating label {label} in {owner_repo}")
+        return
     if r.returncode != 0:
         print(f"[WARN] could not create label {label} in {owner_repo}: {r.stderr[:200]}")
 
@@ -929,9 +943,13 @@ def _add_label(pr_url: str, label: str) -> None:
         owner_repo = ""
     if owner_repo:
         _ensure_label(owner_repo, label)
-    r = subprocess.run(["gh", "pr", "edit", pr_url, "--add-label", label],
-                       capture_output=True, text=True, env=credentialed_env(),
-                       cwd=neutral_dir())
+    try:
+        r = subprocess.run(["gh", "pr", "edit", pr_url, "--add-label", label],
+                           capture_output=True, text=True, env=credentialed_env(),
+                           cwd=neutral_dir(), timeout=60)
+    except subprocess.TimeoutExpired:
+        print(f"[WARN] gh timed out adding the {label} label")
+        return
     if r.returncode != 0:
         print(f"[WARN] failed to add {label} label: {r.stderr[:200]}")
 
@@ -1044,9 +1062,13 @@ def _sync_pr_body(task: AlertTask) -> None:
     body = _build_pr_body(task, task.impact)
     if body == task.pr_body:
         return
-    r = subprocess.run(["gh", "pr", "edit", task.pr_url, "--body", body],
-                       capture_output=True, text=True, env=credentialed_env(),
-                       cwd=neutral_dir())
+    try:
+        r = subprocess.run(["gh", "pr", "edit", task.pr_url, "--body", body],
+                           capture_output=True, text=True, env=credentialed_env(),
+                           cwd=neutral_dir(), timeout=60)
+    except subprocess.TimeoutExpired:
+        print("[WARN] gh timed out updating the PR body with review reasons")
+        return
     if r.returncode != 0:
         print(f"[WARN] could not update PR body with review reasons: {r.stderr[:200]}")
         return
@@ -1125,7 +1147,8 @@ def _push_fix_update(task: AlertTask) -> None:
     if not task.push_url:
         raise RuntimeError("no push URL was recorded for this clone — not pushing")
     _run([*push_git(task.push_url), "push", "--no-verify", task.push_url,
-          f"HEAD:refs/heads/{branch}"], cwd=task.worktree_path, env=credentialed_env())
+          f"HEAD:refs/heads/{branch}"], cwd=task.worktree_path, env=credentialed_env(),
+         timeout=300)
 
 
 # ---------------------------------------------------------------------------
@@ -1987,7 +2010,8 @@ def _clone_repo(repo: Repository) -> Repository:
     # clone's checkout and every later git call in it start hookless; the
     # per-command SAFE_GIT still wins if something rewrites that file.
     _run(["gh", "repo", "clone", repo.url, str(path), "--", "--depth=1",
-          "--config", "core.hooksPath=/dev/null"], cwd=neutral_dir(), env=credentialed_env())
+          "--config", "core.hooksPath=/dev/null"], cwd=neutral_dir(), env=credentialed_env(),
+         timeout=900)
     repo.clone_path = path
     return repo
 
@@ -2084,7 +2108,7 @@ def _print_global_summary(all_results: dict, dry_run: bool = False) -> None:
 def _get_repo_url(repo_name: str) -> str:
     """Resolve the clone URL for an owner/repo via gh CLI."""
     stdout, _, _ = _run(["gh", "repo", "view", repo_name, "--json", "url", "--jq", ".url"],
-                        cwd=neutral_dir(), env=credentialed_env())
+                        cwd=neutral_dir(), env=credentialed_env(), timeout=60)
     return stdout.strip()
 
 

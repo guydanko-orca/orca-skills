@@ -1078,6 +1078,65 @@ class TestRepositoryCodeDoesNotOutliveItsRun(unittest.TestCase):
             self.assertIn("run_in_group(", inspect.getsource(getattr(validator, name)))
 
 
+class TestRunInGroupIsBounded(unittest.TestCase):
+    """Output, time and encoding are the child's to choose; none of them may
+    stall or blank the run."""
+
+    def _in_child(self, body, timeout=20):
+        import subprocess
+        code = ("import sys, time, subprocess\n"
+                f"sys.path[:0] = [{str(_DIR.parent)!r}, {str(_DIR.parent.parent / 'lib')!r}]\n"
+                "import agent_env\n" + body)
+        return subprocess.run([sys.executable, "-I", "-c", code], capture_output=True,
+                              text=True, timeout=timeout)
+
+    def test_output_is_capped_per_stream(self):
+        result = agent_env.run_in_group(
+            [sys.executable, "-c", "import sys; sys.stdout.write('x' * 8_000_000)"])
+        self.assertLessEqual(len(result.stdout), agent_env.OUTPUT_LIMIT + 200)
+        self.assertIn("truncated", result.stdout[-200:])
+
+    def test_invalid_utf8_does_not_blank_the_output(self):
+        result = agent_env.run_in_group(
+            [sys.executable, "-c",
+             "import sys; sys.stdout.buffer.write(b'before \\xff\\xfe after')"])
+        self.assertIn("before", result.stdout)
+        self.assertIn("after", result.stdout)
+
+    def test_the_deadline_covers_writing_stdin(self):
+        """A child that never reads its stdin used to block the write forever,
+        before the deadline had even started."""
+        result = self._in_child(
+            "started = time.monotonic()\n"
+            "try:\n"
+            "    agent_env.run_in_group(['sleep', '30'], input='x' * 10_000_000, timeout=0.5)\n"
+            "except subprocess.TimeoutExpired:\n"
+            "    print(round(time.monotonic() - started, 1))\n")
+        self.assertEqual(result.returncode, 0, result.stderr[-300:])
+        self.assertLess(float(result.stdout.strip()), 5)
+
+    def test_a_hung_git_or_gh_call_cannot_hold_the_gate(self):
+        import time
+        started = time.monotonic()
+        with self.assertRaises(RuntimeError):
+            orchestrator._run(["sleep", "30"], timeout=0.3)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_push_and_gh_calls_carry_a_timeout(self):
+        import inspect
+        import re
+
+        import run_agent
+        self.assertIn("timeout", inspect.signature(run_agent.run).parameters)
+        self.assertIsNotNone(inspect.signature(run_agent.run).parameters["timeout"].default)
+        for module in (orchestrator,):
+            src = inspect.getsource(module)
+            for call in re.finditer(r'\[\s*"gh",|push_git\(', src):
+                window = src[call.start():call.start() + 400]
+                with self.subTest(at=call.start()):
+                    self.assertIn("timeout=", window)
+
+
 class TestConfigGuardFailsClosed(unittest.TestCase):
     """A guard that cannot read the config used to compare None with None and
     pass. Every way of not knowing now fails the alert."""
@@ -1325,6 +1384,7 @@ if __name__ == "__main__":
         TestRepositoryCodeHoldsTheGateOnlyWhileItRuns,
         TestPoisonedCloneRunsNoMoreGit,
         TestRepositoryCodeDoesNotOutliveItsRun,
+        TestRunInGroupIsBounded,
         TestConfigGuardFailsClosed,
         TestGitConfigIsReadOnceAtStart,
     ]

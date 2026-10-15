@@ -34,17 +34,22 @@ from version_data import ecosystem_for_manifest, resolve_bump, resolve_ecosystem
 # Helpers
 # ---------------------------------------------------------------------------
 
-def run(cmd, check=True, capture=True, cwd=None, env=None):
+def run(cmd, check=True, capture=True, cwd=None, env=None, timeout=300):
     """Run a command. Returns (stdout, stderr, returncode).
 
     env defaults to git_env(), which holds no credential; the push, the commit
-    and gh pass credentialed_env() explicitly.
+    and gh pass credentialed_env() explicitly. timeout: the orchestrator calls
+    the commit and the push holding the clone exclusively, so a hung push must
+    end; expiry raises RuntimeError like any failed command.
     """
-    result = subprocess.run(
-        cmd, shell=isinstance(cmd, str),
-        capture_output=capture, text=True, cwd=cwd,
-        env=env if env is not None else git_env()
-    )
+    try:
+        result = subprocess.run(
+            cmd, shell=isinstance(cmd, str),
+            capture_output=capture, text=True, cwd=cwd, timeout=timeout,
+            env=env if env is not None else git_env()
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"timed out after {timeout}s: {cmd!r:.120}") from e
     if check and result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"Command failed: {cmd}")
     return result.stdout.strip(), result.stderr.strip(), result.returncode

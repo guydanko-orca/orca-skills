@@ -482,25 +482,22 @@ def _run_in_group(cmd, *, input=None, timeout=None, cwd=None, env=None
     does not. A child that leaves the group itself — setsid(), or setpgid()
     alone — is not caught.
     """
+    deadline = None if timeout is None else time.monotonic() + timeout
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else
                             subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, cwd=cwd, env=env,
+                            stderr=subprocess.PIPE, cwd=cwd, env=env,
                             start_new_session=True)
-    out: list[str] = []
-    err: list[str] = []
-    readers = [threading.Thread(target=lambda s=stream, sink=sink: sink.append(s.read()),
-                                daemon=True)
+    out: list[bytes] = []
+    err: list[bytes] = []
+    threads = [threading.Thread(target=_drain, args=(stream, sink), daemon=True)
                for stream, sink in ((proc.stdout, out), (proc.stderr, err))]
-    for reader in readers:
-        reader.start()
     if input is not None:
-        try:
-            proc.stdin.write(input)
-        except BrokenPipeError:
-            pass
-        finally:
-            proc.stdin.close()
-    deadline = None if timeout is None else time.monotonic() + timeout
+        # Written on a thread, under the same deadline: a child that never reads
+        # its stdin would otherwise block the write before the clock started.
+        threads.append(threading.Thread(target=_feed, args=(proc.stdin, input),
+                                        daemon=True))
+    for thread in threads:
+        thread.start()
     timed_out = False
     while not _exited(proc):
         if deadline is not None and time.monotonic() >= deadline:
@@ -509,11 +506,46 @@ def _run_in_group(cmd, *, input=None, timeout=None, cwd=None, env=None
         time.sleep(0.05)
     _kill_group(proc.pid)
     proc.wait()
-    # Bounded: a child that left the group (setsid or setpgid) and kept the pipe open
-    # would otherwise hold the alert forever. Its late output is dropped.
-    for reader in readers:
-        reader.join(5)
-    stdout, stderr = "".join(out), "".join(err)
+    # Bounded: a child that left the group (setsid or setpgid) and kept the pipe
+    # open would otherwise hold the alert forever. Its late output is dropped.
+    for thread in threads:
+        thread.join(5)
+    stdout, stderr = _decode(out), _decode(err)
     if timed_out:
         raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+# Per stream. Build logs and agent transcripts past this are not read by
+# anything that matters, and holding them is how a child exhausts memory.
+OUTPUT_LIMIT = 5 * 1024 * 1024
+
+
+def _drain(stream, sink: list) -> None:
+    kept = 0
+    dropped = 0
+    while chunk := stream.read(65536):
+        if kept < OUTPUT_LIMIT:
+            sink.append(chunk[:OUTPUT_LIMIT - kept])
+            dropped += max(0, len(chunk) - (OUTPUT_LIMIT - kept))
+            kept += len(sink[-1])
+        else:
+            dropped += len(chunk)
+    if dropped:
+        sink.append(f"\n[output truncated: {dropped} bytes dropped]\n".encode())
+
+
+def _feed(stream, text: str) -> None:
+    try:
+        stream.write(text.encode())
+    except (BrokenPipeError, OSError):
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            stream.close()
+
+
+def _decode(chunks: list) -> str:
+    # Repository output is not promised to be UTF-8; a strict decode raised in
+    # the reader thread and the whole stream came back empty.
+    return b"".join(chunks).decode("utf-8", errors="replace")
