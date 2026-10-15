@@ -1086,7 +1086,11 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
         p.repo = repo.name
         notifier.notify("validation_failed", p)
         return task
-    if llm_val.needs_review:
+    if llm_val.outcome == "unconfirmed":
+        detail = "; ".join(llm_val.failures)
+        _flag_review(task, f"LLM validation could not confirm this fix: {detail}" if detail
+                     else "LLM validation could not confirm this fix: no verdict was returned")
+    elif llm_val.needs_review:
         detail = "; ".join(llm_val.failures)
         _flag_review(task, f"LLM validation was uncertain: {detail}" if detail
                      else "LLM validation returned an uncertain verdict")

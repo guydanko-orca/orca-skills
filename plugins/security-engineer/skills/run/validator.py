@@ -32,7 +32,17 @@ class ValidationResult:
     passed: bool
     phase: str                        # "sanity" | "llm" | "local_build" | "ci" | "orca_check"
     failures: list[str] = field(default_factory=list)
-    needs_review: bool = False        # True when LLM verdict is "uncertain"
+    needs_review: bool = False        # True when a gate passed without confirming
+    # Gate 2 only: "pass" | "fail" | "uncertain" | "unconfirmed". "unconfirmed"
+    # means no verdict was obtained at all — a timeout, an error, output that
+    # could not be read — which is not the model saying "uncertain".
+    outcome: str = ""
+
+    def __post_init__(self):
+        # A gate that could not confirm must never read as a clean pass, so the
+        # flag cannot be left off by whoever builds the result.
+        if self.outcome == "unconfirmed":
+            self.needs_review = True
 
 
 @dataclass
@@ -312,22 +322,35 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
                                 timeout=timeout_sec, env=agent_env())
     except subprocess.TimeoutExpired:
         print(f"[WARN] LLM validation timed out after {timeout_sec}s")
-        return ValidationResult(passed=True, phase="llm", needs_review=True,
-                                failures=["LLM validation timed out — flagged for human review"])
+        return _unconfirmed(f"LLM validation timed out after {timeout_sec}s")
 
     if result.returncode != 0:
         # The CLI's own failure output can echo the prompt back, so it is an
         # egress path too — the console here, and `failures` onward.
         detail = redactor(_subprocess_error_detail(result))
         print(f"[WARN] LLM validation failed (exit={result.returncode}): {detail}")
-        return ValidationResult(passed=True, phase="llm", needs_review=True,
-                                failures=[f"LLM validation errored (exit={result.returncode}): {detail}"])
+        return _unconfirmed(f"LLM validation errored (exit={result.returncode}): {detail}")
 
     return _parse_llm(result.stdout, redactor)
 
 
+def _unconfirmed(why: str) -> ValidationResult:
+    """Gate 2 obtained no verdict. Ships, labelled needs-review — never as a pass.
+
+    Not a block: the degradation policy in HARNESS.md is fail closed on evidence
+    of a bad fix and open on absence of evidence, and a timeout is the latter.
+    """
+    return ValidationResult(passed=True, phase="llm", outcome="unconfirmed",
+                            failures=[f"{why} — flagged for human review"])
+
+
 def _parse_llm(raw: str, redactor=None) -> ValidationResult:
     """Parse the validation verdict.
+
+    Only an explicit "pass" passes. A verdict outside the three the prompt asks
+    for used to fall through to the final branch and ship as a clean pass with
+    no review marker, which is the one outcome a gate that read nothing must not
+    produce.
 
     redactor: scrubs the model's own prose. Asked to explain a secret fix, a model
               will happily name the credential it saw, and `reason` flows on to the
@@ -337,26 +360,30 @@ def _parse_llm(raw: str, redactor=None) -> ValidationResult:
     try:
         envelope = json.loads(raw)
         text = envelope.get("result", "") or raw
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, AttributeError):
         text = raw
 
-    data = find_last_json_with_key(text, "verdict")
+    data = find_last_json_with_key(text, "verdict") if text else None
     if not data:
         snippet = redactor(text[:200]) if text else "(empty)"
         print(f"[WARN] could not parse LLM validation output: {snippet}")
-        return ValidationResult(passed=True, phase="llm", needs_review=True,
-                                failures=[f"Could not parse LLM validation response: {snippet}"])
+        return _unconfirmed(f"Could not parse LLM validation response: {snippet}")
 
-    verdict = data.get("verdict", "uncertain")
-    reason = redactor(data.get("reason", ""))
-    concerns = redactor.scrub(data.get("concerns") or [])
+    raw_verdict = data.get("verdict")
+    verdict = raw_verdict.strip().lower() if isinstance(raw_verdict, str) else ""
+    reason = redactor(str(data.get("reason") or ""))
+    concerns = data.get("concerns") or []
+    concerns = redactor.scrub([concerns] if isinstance(concerns, str) else list(concerns))
 
     if verdict == "fail":
-        return ValidationResult(passed=False, phase="llm", failures=[reason])
-    elif verdict == "uncertain":
-        return ValidationResult(passed=True, phase="llm", needs_review=True, failures=concerns)
-    else:
-        return ValidationResult(passed=True, phase="llm")
+        return ValidationResult(passed=False, phase="llm", outcome="fail", failures=[reason])
+    if verdict == "uncertain":
+        return ValidationResult(passed=True, phase="llm", outcome="uncertain",
+                                needs_review=True, failures=concerns)
+    if verdict == "pass":
+        return ValidationResult(passed=True, phase="llm", outcome="pass")
+    shown = redactor(str(raw_verdict)[:40])
+    return _unconfirmed(f"LLM validation returned no recognised verdict ({shown!r})")
 
 
 # ---------------------------------------------------------------------------

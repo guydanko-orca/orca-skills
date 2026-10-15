@@ -10,6 +10,7 @@ No API token or network access required — all tests are pure Python.
 """
 import contextlib
 import inspect
+import json
 import shutil
 import subprocess
 import sys
@@ -1591,10 +1592,120 @@ class TestLLMValidationErrors(unittest.TestCase):
                 result = llm_validate({"alert_id": "test-1"}, Path("/tmp"))
                 self.assertTrue(result.passed, f"{desc}: should pass (flagged, not blocked)")
                 self.assertTrue(result.needs_review, f"{desc}: should flag for review")
+                self.assertEqual(result.outcome, "unconfirmed", desc)
                 self.assertTrue(
                     any(expected_substr in f for f in result.failures),
                     f"{desc}: expected '{expected_substr}' in failures: {result.failures}"
                 )
+
+
+class TestLlmVerdictParsing(unittest.TestCase):
+    """Only an explicit "pass" is a pass. Anything the gate cannot read as one
+    of its three verdicts is unconfirmed — it used to fall through to the final
+    `else` and ship as a clean pass with no review marker at all."""
+
+    CASES = [
+        ("explicit pass",        {"verdict": "pass"},             "pass",        False),
+        ("pass in capitals",     {"verdict": " PASS "},           "pass",        False),
+        ("explicit fail",        {"verdict": "fail", "reason": "no"}, "fail",    False),
+        ("fail in capitals",     {"verdict": "Fail", "reason": "no"}, "fail",    False),
+        ("uncertain",            {"verdict": "uncertain"},        "uncertain",   True),
+        ("unknown word",         {"verdict": "approved"},         "unconfirmed", True),
+        ("null verdict",         {"verdict": None},               "unconfirmed", True),
+        ("non-string verdict",   {"verdict": True},               "unconfirmed", True),
+        ("empty verdict",        {"verdict": ""},                 "unconfirmed", True),
+    ]
+
+    def test_cases(self):
+        from validator import _parse_llm
+        for desc, data, outcome, review in self.CASES:
+            with self.subTest(desc):
+                raw = json.dumps({"result": json.dumps(data)})
+                result = _parse_llm(raw)
+                self.assertEqual(result.outcome, outcome, desc)
+                self.assertEqual(result.needs_review, review, desc)
+                self.assertEqual(result.passed, outcome != "fail", desc)
+                if outcome == "unconfirmed":
+                    self.assertTrue(result.failures, f"{desc}: says why")
+
+    def test_garbage_output_is_unconfirmed(self):
+        from validator import _parse_llm
+        for desc, raw in (("prose", "I would like to look at the repo first."),
+                          ("empty", ""),
+                          ("json without a verdict", '{"result": "{\\"ok\\": true}"}')):
+            with self.subTest(desc):
+                result = _parse_llm(raw)
+                self.assertEqual(result.outcome, "unconfirmed", desc)
+                self.assertTrue(result.needs_review, desc)
+
+    def test_unconfirmed_always_needs_review(self):
+        """An unconfirmed result cannot be built without the review flag."""
+        self.assertTrue(ValidationResult(passed=True, phase="llm",
+                                         outcome="unconfirmed").needs_review)
+
+
+class TestUnconfirmedLlmVerdictReachesThePr(unittest.TestCase):
+    """An unconfirmed gate 2 ships labelled, with its own reason in the body —
+    not reworded as an "uncertain" verdict the model never gave."""
+
+    def _run(self, llm_result):
+        task = AlertTask(alert_id="orca-llm-1", title="Path Traversal",
+                         risk_level="high", feature_type="sast", source="server.js:40",
+                         alert_json={"alert_id": "orca-llm-1", "feature_type": "sast"})
+        captured = {}
+
+        def open_pr(t, impact, dry_run):
+            t.pr_body = captured["body"] = orchestrator._build_pr_body(t, impact)
+            return "https://github.com/owner/repo/pull/1"
+
+        val_pass = ValidationResult(passed=True, phase="sanity")
+        with patch("orchestrator._create_worktree", return_value=Path("/tmp/orca-fix-t")), \
+             patch("orchestrator._remove_worktree"), \
+             patch("orchestrator._invoke_fix_agent", return_value=FixAgentResult(
+                 success=True, files_changed=["server.js"], diff_summary="patched")), \
+             patch("orchestrator.sanity_check", return_value=val_pass), \
+             patch("orchestrator.llm_validate", return_value=llm_result), \
+             patch("pipelines.base.local_build_check", return_value=val_pass), \
+             patch("orchestrator._get_diff", return_value="diff"), \
+             patch("orchestrator.analyze_impact", return_value=ImpactResult(
+                 level="low", description="minor", downtime_risk=False,
+                 requires_deploy=True)), \
+             patch("orchestrator._commit_and_pr", side_effect=open_pr), \
+             patch("orchestrator.orca_check_gate",
+                   return_value=ValidationResult(passed=True, phase="orca_check")), \
+             patch("orchestrator.ci_gate",
+                   return_value=ValidationResult(passed=True, phase="ci")), \
+             patch("orchestrator.subprocess.run",
+                   return_value=subprocess.CompletedProcess([], 0, "", "")) as gh:
+            result = run_one(task, dry_run=False, notifier=MagicMock(), repo=Repository(
+                name="owner/repo", url="https://github.com/owner/repo"))
+        return result, captured.get("body", ""), gh
+
+    def test_timeout_is_labelled_and_explained(self):
+        result, body, gh = self._run(ValidationResult(
+            passed=True, phase="llm", outcome="unconfirmed",
+            failures=["LLM validation timed out — flagged for human review"]))
+        self.assertEqual(result.state, "DONE")
+        self.assertTrue(result.needs_review)
+        reason = result.review_reasons[0]
+        self.assertIn("could not confirm", reason)
+        self.assertIn("timed out", reason)
+        self.assertNotIn("uncertain", reason)
+        self.assertIn(reason, body)
+        labels = [c.args[0][-1] for c in gh.call_args_list if "--add-label" in c.args[0]]
+        self.assertIn("needs-review", labels)
+
+    def test_unconfirmed_without_a_reason_still_flags(self):
+        result, body, _ = self._run(ValidationResult(
+            passed=True, phase="llm", outcome="unconfirmed"))
+        self.assertTrue(result.needs_review)
+        self.assertIn("could not confirm", body)
+
+    def test_a_pass_adds_no_marker(self):
+        result, body, _ = self._run(ValidationResult(passed=True, phase="llm",
+                                                     outcome="pass"))
+        self.assertFalse(result.needs_review)
+        self.assertNotIn("Needs human review", body)
 
 
 # ---------------------------------------------------------------------------
@@ -2754,6 +2865,8 @@ if __name__ == "__main__":
         TestBuildPromptContext,
         TestImpactAnalysisErrors,
         TestLLMValidationErrors,
+        TestLlmVerdictParsing,
+        TestUnconfirmedLlmVerdictReachesThePr,
         TestOrcaCheckRetry,
         TestConfig,
         TestDiffLineCount,

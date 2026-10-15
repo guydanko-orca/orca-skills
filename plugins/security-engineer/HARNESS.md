@@ -119,7 +119,7 @@ the commit will contain.
 | # | Gate | Checks | On failure |
 |---|---|---|---|
 | 1 | **sanity** (`validator.sanity_check`) | Diff is non-empty; within the type's line budget (cve 200, sast 100, iac/secret 50); no added line matches a secret pattern, **whatever the finding type** — a CVE bump that pastes a token into a lockfile fails here too; the agent's own `diff_summary` does not name a version its diff never added | `FAILED`, no PR |
-| 2 | **llm** (`validator.llm_validate`) | A single-shot model call: does this diff address this alert? `pass` / `fail` / `uncertain` | `fail` → `FAILED`. `uncertain` → passes, PR labelled `needs-review` |
+| 2 | **llm** (`validator.llm_validate`) | A single-shot model call: does this diff address this alert? `pass` / `fail` / `uncertain` | `fail` → `FAILED`. `uncertain` → passes, PR labelled `needs-review`. No verdict at all — timeout, error, unreadable output, or any word but those three — is `unconfirmed`: passes, labelled `needs-review`, and the body says the gate could not confirm the fix. Only an explicit `pass` ships unmarked |
 | 3 | **verify** (`pipeline.verify`) | **CVE:** the manifest still declares the package; it is no longer on the version the alert was raised against; if the agent chose a different version, that version carries no known advisory; a lockfile beside the manifest agrees; then `go build ./...` (Go) or `cargo metadata --locked` (Cargo). **Other types:** language build check (below) | `FAILED`, no PR |
 | 4 | **orca** (`validator.orca_check_gate`) | Polls the Orca GitHub App check on the PR head SHA. On failure, pulls the check **annotations** — file, line, message | Reverts the worktree to the branch head, re-invokes the fix agent *with the annotations as feedback*, re-runs gates 1 and 3, and pushes a follow-up commit to the same PR branch. After `max_retries`, follows `on_failure` |
 | 5 | **ci** (`validator.ci_gate`) | `gh pr checks --watch --fail-fast`, 10 min | `CI_FAILED`, PR labelled `ci-failed`, run exits non-zero. The PR stays open |
@@ -383,7 +383,7 @@ of a bad fix, fail open on absence of evidence — and say so.**
 | Orca check reports findings | **Closed after retries** — per `on_failure`. The PR is already open, so a `FAILED` here, or a retry that is abandoned, also labels it `needs-review` and puts the reason in its body |
 | CI red | **Closed** — `CI_FAILED`, exit 1, PR labelled |
 | Branch holds commits not in `main` | **Closed** — `SKIPPED`, work untouched |
-| LLM validation times out / errors / returns unparseable output | Open + `needs-review` |
+| LLM validation times out / errors / returns unparseable output or an unknown verdict | Open + `needs-review` — an explicit `unconfirmed` outcome with its own reason in the PR body, never a pass |
 | Orca check absent after the grace period | Open + `needs-review` (`on_not_found: fail` inverts this) |
 | PR has no CI configured, or `gh` is missing | Open + `needs-review` |
 | Build toolchain not installed | Open — skipped |
