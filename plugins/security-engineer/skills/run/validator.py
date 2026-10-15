@@ -23,7 +23,7 @@ from _json_util import find_last_json_with_key
 from agent_env import HOOKLESS_GIT, agent_env, build_env
 from orca_client import _resolve_feature_type
 from paths import resolve_within
-from redact import build_redactor
+from redact import SECRET_PATTERNS, build_redactor
 from untrusted import bound, bound_strings, fence, new_nonce, preamble
 
 
@@ -157,11 +157,9 @@ def diff_line_count(diff_text: str) -> int:
 # same alert, so at 50 that whole class of finding could never pass.
 _DIFF_LIMITS = {"sast": 100, "iac": 50, "secret": 50, "cve": 200}
 
-_SECRET_PATTERNS = [
-    r'(?i)(api_?key|password|secret|token)\s*[=:]\s*["\'][^"\']{8,}["\']',
-    r'sk-[A-Za-z0-9]{20,}',
-    r'(?i)bearer\s+[A-Za-z0-9+/]{20,}',
-]
+# One list, owned by redact.py, so the shapes this gate refuses to add and the
+# shapes the redactor falls back to scrubbing cannot drift apart.
+_SECRET_PATTERNS = SECRET_PATTERNS
 
 
 _VERSION_TOKEN = re.compile(r"\bv?\d+\.\d+(?:\.\d+)*(?:[-+.][0-9A-Za-z.-]+)?\b")

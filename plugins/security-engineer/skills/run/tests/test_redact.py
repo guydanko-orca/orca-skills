@@ -19,10 +19,12 @@ Hermetic: no network, no claude subprocess.
 
 Run with: python3 tests/test_redact.py
 """
+import base64
 import hashlib
 import io
 import sys
 import unittest
+import unittest.mock
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -91,6 +93,147 @@ class TestCandidateExtraction(unittest.TestCase):
 
     def test_none_alert_is_safe(self):
         self.assertFalse(build_redactor(None))
+
+
+# Shapes a masked code_snippet could take. Unverified against the live API —
+# nothing in this repository shows Orca's secret snippet either way — so the
+# redactor has to be safe for both.
+MASKED_SNIPPETS = [
+    ("asterisks in the value",  ['API_KEY = "sk-****"']),
+    ("partially starred",       ['aws_secret = "AKIA************WXYZ"']),
+    ("fully starred",           ['password: "**************"']),
+    ("bullet mask",             ['TOKEN = "••••••••••"']),
+    ("redacted marker",         ['API_KEY = "[REDACTED]"']),
+    ("no snippet at all",       []),
+    ("only a short value",      ['x = "ab"']),
+]
+
+# A high-entropy credential with no name a pattern can anchor on. Derived, like
+# SECRET, so the source holds no literal for a scanner to flag.
+UNLABELLED = base64.b64encode(hashlib.sha256(b"orca-redact-unlabelled").digest()).decode()[:32]
+
+
+class TestMaskedSnippetFallsBackToPatterns(unittest.TestCase):
+    """Candidates come from code_snippet. If Orca masks the value there, every
+    candidate is a string that never appears anywhere and the redactor matched
+    nothing — silently, with no sign that it had."""
+
+    def _alert(self, snippet):
+        return dict(SECRET_ALERT, code_snippet=snippet)
+
+    def test_masked_or_empty_snippet_gets_a_live_fallback(self):
+        for desc, snippet in MASKED_SNIPPETS:
+            with self.subTest(desc):
+                r = build_redactor(self._alert(snippet))
+                self.assertTrue(r, desc)
+                self.assertTrue(r.fallback_reason, desc)
+                self.assertFalse([c for c in r.candidates if "*" in c or "•" in c],
+                                 f"{desc}: a masked candidate matches nothing")
+
+    def test_fallback_scrubs_the_credential_from_a_diff_and_keeps_the_key(self):
+        r = build_redactor(self._alert(['API_KEY = "sk-****"']))
+        out = r(f'-API_KEY = "{SECRET}"\n+API_KEY = os.environ["API_KEY"]')
+        self.assertNotIn(SECRET, out)
+        self.assertIn(PLACEHOLDER, out)
+        self.assertIn('-API_KEY = "', out, "keys are never redacted")
+        self.assertIn('os.environ["API_KEY"]', out, "the fix side must survive")
+
+    def test_fallback_scrubs_known_token_shapes(self):
+        r = build_redactor(self._alert([]))
+        token = "sk-" + hashlib.sha256(b"sk-shape").hexdigest()[:32]
+        bearer = hashlib.sha256(b"bearer-shape").hexdigest()[:32]
+        for text, secret in ((f"key is {token}", token),
+                             (f"Authorization: Bearer {bearer}", bearer),
+                             (f'creds = ["{UNLABELLED}"]', UNLABELLED)):
+            with self.subTest(secret[:6]):
+                self.assertNotIn(secret, r(text))
+
+    def test_fallback_leaves_prose_and_names_alone(self):
+        r = build_redactor(self._alert([]))
+        prose = ("Rotate the exposed credential, then set API_KEY and "
+                 "AWS_SECRET_ACCESS_KEY in the deployment environment.")
+        self.assertEqual(r(prose), prose)
+
+    def test_fallback_leaves_fence_tags_intact(self):
+        """The redactor runs over the whole fenced validation prompt."""
+        from untrusted import fence, new_nonce, preamble
+        nonce = new_nonce()
+        prompt = preamble(nonce) + fence("diff", f'-API_KEY = "{SECRET}"', nonce)
+        out = build_redactor(self._alert([]))(prompt)
+        self.assertNotIn(SECRET, out)
+        self.assertIn(f'<untrusted-{nonce} id="diff">', out)
+        self.assertIn(f"</untrusted-{nonce}>", out)
+        self.assertIn(f"untrusted-{nonce} id=", preamble(nonce))
+        self.assertEqual(out.count(f"untrusted-{nonce}"), prompt.count(f"untrusted-{nonce}"))
+
+    def test_fallback_reason_carries_no_snippet_content(self):
+        r = build_redactor(self._alert(['API_KEY = "sk-li****"']))
+        self.assertNotIn("sk-li", r.fallback_reason)
+
+    def test_a_usable_snippet_needs_no_fallback(self):
+        r = build_redactor(SECRET_ALERT)
+        self.assertIsNone(r.fallback_reason)
+        self.assertIn(SECRET, r.candidates)
+
+    def test_surviving_candidates_still_apply_alongside_patterns(self):
+        """A masked line can still carry a literal worth scrubbing exactly."""
+        alert = self._alert([f'connect("{SECRET}", password="****")'])
+        r = build_redactor(alert)
+        self.assertTrue(r.fallback_reason)
+        self.assertIn(SECRET, r.candidates)
+        self.assertNotIn(SECRET, r(f"uses {SECRET}"))
+
+    def test_non_secret_alert_stays_untouched_even_with_no_snippet(self):
+        r = build_redactor(dict(CVE_ALERT, code_snippet=[]))
+        self.assertFalse(r)
+        self.assertIsNone(r.fallback_reason)
+
+    def test_the_sanity_gate_and_the_fallback_share_one_pattern_list(self):
+        import redact
+        self.assertIs(validator._SECRET_PATTERNS, redact.SECRET_PATTERNS)
+
+    def test_masked_secret_alert_is_flagged_for_review(self):
+        """The fallback can miss a credential no pattern recognises, so the PR
+        has to say that redaction ran blind."""
+        from impact_agent import ImpactResult
+        from orca_client import Repository
+        from validator import ValidationResult
+
+        task = orchestrator.AlertTask(
+            alert_id="orca-abc123", title="Hardcoded secret", risk_level="high",
+            feature_type="secret", source="app.py:14",
+            alert_json=self._alert(['API_KEY = "sk-****"']))
+        captured = {}
+
+        def open_pr(t, impact, dry_run):
+            t.pr_body = captured["body"] = orchestrator._build_pr_body(t, impact)
+            return "https://github.com/o/r/pull/1"
+
+        ok = ValidationResult(passed=True, phase="sanity")
+        with patch("orchestrator._create_worktree", return_value=Path("/tmp/orca-fix-t")), \
+             patch("orchestrator._remove_worktree"), \
+             patch("orchestrator._invoke_fix_agent",
+                   return_value=orchestrator.FixAgentResult(
+                       success=True, files_changed=["app.py"], diff_summary="moved to env")), \
+             patch("orchestrator.sanity_check", return_value=ok), \
+             patch("orchestrator.llm_validate",
+                   return_value=ValidationResult(passed=True, phase="llm", outcome="pass")), \
+             patch("pipelines.base.local_build_check", return_value=ok), \
+             patch("orchestrator._get_diff", return_value="diff"), \
+             patch("orchestrator.analyze_impact", return_value=ImpactResult(
+                 level="low", description="", downtime_risk=False, requires_deploy=True)), \
+             patch("orchestrator._commit_and_pr", side_effect=open_pr), \
+             patch("orchestrator.orca_check_gate",
+                   return_value=ValidationResult(passed=True, phase="orca_check")), \
+             patch("orchestrator.ci_gate", return_value=ValidationResult(passed=True, phase="ci")), \
+             patch("orchestrator.subprocess.run") as gh, \
+             redirect_stdout(io.StringIO()):
+            gh.return_value.returncode = 0
+            result = orchestrator.run_one(task, dry_run=False, notifier=unittest.mock.MagicMock(),
+                                          repo=Repository(name="o/r", url="https://github.com/o/r"))
+        self.assertTrue(result.needs_review)
+        self.assertTrue(any("masked" in r for r in result.review_reasons), result.review_reasons)
+        self.assertIn("masked", captured["body"])
 
 
 class TestRedactor(unittest.TestCase):

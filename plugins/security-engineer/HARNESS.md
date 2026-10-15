@@ -406,6 +406,18 @@ Only secret findings build a live redactor. For a SAST or CVE alert the
 `code_snippet` is ordinary vulnerable code, and scrubbing it from the diff would
 blind gate 2 to the lines it has to judge.
 
+All of that assumes the snippet carries the credential verbatim. Whether Orca
+ever returns it masked could not be checked here — no fixture or test in this
+repository shows a secret alert's snippet, and Orca's public docs do not say —
+so the redactor is built to be safe either way. A masked string (`sk-****`,
+`[REDACTED]`) is never a candidate, since it matches nothing real. If the
+snippet looks masked or yields no value at all, a secret finding's redactor
+falls back to redacting by shape on every egress path: the sanity gate's own
+`SECRET_PATTERNS` (one list, shared, value group only so keys survive) plus any
+20+ character token with letters, digits and at least 3.8 bits of entropy per
+character. Shapes can miss a credential, so the alert is also flagged
+`needs-review` with that reason in the PR body, before the fix agent runs.
+
 ## Degradation policy
 
 A harness that fails closed on every unknown never finishes; one that fails open
@@ -427,6 +439,7 @@ of a bad fix, fail open on absence of evidence — and say so.**
 | Build toolchain not installed | Open — skipped |
 | OSV / deps.dev unreachable, unknown ecosystem, unparsed manifest | Open — unguided fix + `needs-review` |
 | Impact analysis fails | Open — recorded as `medium`, error kept in the event log |
+| Secret finding whose `code_snippet` is masked or has no usable value | Open — redaction by pattern and entropy instead of exact value, `needs-review` |
 
 The one asymmetry worth naming: the advisory lookup that judges an
 agent-chosen version fails *open*, because an OSV outage should not turn into a

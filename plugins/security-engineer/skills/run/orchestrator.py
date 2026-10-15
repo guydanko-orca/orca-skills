@@ -997,6 +997,15 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
 
     pipeline = get_pipeline(task.feature_type, timeouts=TIMEOUTS)
 
+    # A secret finding whose snippet could not supply the credential is redacted
+    # by pattern on every egress path, which can miss one. Known now, so it
+    # reaches the PR body however the run ends.
+    fallback = build_redactor(task.alert_json).fallback_reason
+    if fallback:
+        print(f"[WARN] {task.alert_id} code_snippet has no usable credential value — "
+              f"redacting by pattern", flush=True)
+        _flag_review(task, fallback)
+
     # Phase 0: let the type's specialist work out what it can before the agent
     # runs. A failure here is never fatal — we fall through to the agent's own
     # judgement, which is what happened for every fix before this existed.
