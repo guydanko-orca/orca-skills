@@ -14,6 +14,7 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -265,6 +266,62 @@ def _remove_worktree(path: Path | None, branch: str | None = None,
                        capture_output=True, cwd=cwd)
     if branch:
         subprocess.run([*HOOKLESS_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd)
+
+
+# The effective git config of each clone, keyed by its common git dir, as first
+# seen before any fix agent in it ran. HOOKLESS_GIT overrides the keys known to
+# run commands from a hook; this catches the rest — credential.helper,
+# core.sshCommand, an include.path — which code run by a fix agent's regen or a
+# build check could write, and which the orchestrator's push would then run
+# with our credentials. Per clone rather than per alert, because the config is
+# shared by every worktree: an alert that starts after another poisoned it must
+# compare against the config from before, not adopt the poisoned one.
+_CONFIG_BASELINES: dict[str, str | None] = {}
+_CONFIG_LOCK = threading.Lock()
+
+
+def _git_config_snapshot(worktree: Path) -> str | None:
+    """The effective config as git resolves it here, includes followed.
+
+    Values and scopes only: origins name per-worktree files, which would make
+    two worktrees of the same clone disagree about an identical config.
+    """
+    try:
+        r = subprocess.run(["git", "config", "--list", "--show-scope", "--includes"],
+                           cwd=worktree, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _config_key(worktree: Path) -> str:
+    try:
+        r = subprocess.run(["git", "rev-parse", "--path-format=absolute",
+                            "--git-common-dir"],
+                           cwd=worktree, capture_output=True, text=True, timeout=30)
+        if r.returncode == 0 and str(r.stdout).strip():
+            return str(r.stdout).strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return str(worktree)
+
+
+def _config_baseline(worktree: Path) -> str | None:
+    """Record the clone's config the first time any alert in it asks."""
+    key = _config_key(worktree)
+    with _CONFIG_LOCK:
+        if key not in _CONFIG_BASELINES:
+            _CONFIG_BASELINES[key] = _git_config_snapshot(worktree)
+        return _CONFIG_BASELINES[key]
+
+
+def _config_drift(worktree: Path, baseline: str | None) -> str:
+    """A failure reason if the config no longer matches the baseline, else ""."""
+    if _git_config_snapshot(worktree) == baseline:
+        return ""
+    return ("git config changed while repository code ran (fix agent or build "
+            "check) — no further git command runs in this worktree with our "
+            "credentials. Inspect the clone's .git/config and included files.")
 
 
 def _get_diff(worktree_path: Path) -> str:
@@ -996,6 +1053,20 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     notifier.notify("fix_started", p)
 
     pipeline = get_pipeline(task.feature_type, timeouts=TIMEOUTS)
+    config_baseline = _config_baseline(task.worktree_path)
+
+    def config_drifted(event: str) -> bool:
+        reason = _config_drift(task.worktree_path, config_baseline)
+        if not reason:
+            return False
+        task.state = "FAILED"
+        task.failure_reason = reason
+        if task.pr_url:
+            _mark_open_pr_failed(task, reason)
+        p = _notify_payload(task)
+        p.repo = repo.name
+        notifier.notify(event, p)
+        return True
 
     # A secret finding whose snippet could not supply the credential is redacted
     # by pattern on every egress path, which can miss one. Known now, so it
@@ -1030,6 +1101,9 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     while task.attempts < MAX_RETRIES:
         task.attempts += 1
         fix_result = _invoke_fix_agent(task, dry_run, timeout)
+        # Before anything else runs git here, _revert included.
+        if config_drifted("fix_failed"):
+            return task
 
         if fix_result.timed_out:
             task.state = "TIMED_OUT"
@@ -1132,6 +1206,9 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     # Commit + PR
     task.state = "COMMITTING"
     print(f"[PHASE] {task.alert_id} commit + open PR", flush=True)
+    # The build check in pipeline.verify ran repository code too.
+    if config_drifted("validation_failed"):
+        return task
     try:
         pr_url = _commit_and_pr(task, task.impact, dry_run)
     except RuntimeError as e:
@@ -1197,6 +1274,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                 timeout = pipeline.timeout_sec
                 fix_result = _invoke_fix_agent(task, dry_run, timeout,
                                                feedback=orca_feedback)
+                if config_drifted("fix_failed"):
+                    return task
                 if not fix_result.success:
                     task.state = "FAILED"
                     task.failure_reason = fix_result.failure_reason
@@ -1234,6 +1313,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                     return task
 
                 # Push updated fix to same PR branch
+                if config_drifted("validation_failed"):
+                    return task
                 try:
                     _push_fix_update(task)
                 except RuntimeError as e:

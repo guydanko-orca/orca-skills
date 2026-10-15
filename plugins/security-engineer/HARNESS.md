@@ -330,20 +330,34 @@ run whatever hooks the repository has configured — husky, pre-commit, pre-push
 in the orchestrator's own environment, which holds the Orca token and `gh`'s
 credentials. In single-repo mode those are the operator's live hooks, and a
 lockfile regen that executes repository code (`bundle lock` evaluates the
-Gemfile) can rewrite `core.hooksPath` in the shared `.git/config` mid-run. Every
-git call the pipeline makes that can fire a hook — the `git add -N` behind the
-diff the gates read, staging, commit, push, revert, and the worktree's creation
-and teardown (`worktree add`/`remove`, `branch -D`) — therefore runs as
-`git -c core.hooksPath=/dev/null …` (`agent_env.HOOKLESS_GIT`), plus
-`--no-verify` on commit and push; a command-line `-c` outranks every config file.
+Gemfile) can rewrite the shared `.git/config` mid-run. Two layers deal with it.
+
+The first overrides what config can make git run. The pipeline's own git calls
+— the `git add -N` behind the diff the gates read, staging, commit, push,
+revert, and the worktree's creation and teardown — run through
+`agent_env.HOOKLESS_GIT`: `core.hooksPath=/dev/null` for hook scripts,
+`core.fsmonitor=false`, and `hook.<event>.enabled=false` for every event in
+githooks(5), which is what stops config-defined hooks (`hook.<name>.command`,
+git 2.54+) that `core.hooksPath` never reaches. Commit and push add
+`--no-verify`. A command-line `-c` outranks every config file; git older than
+2.54 has no config hooks and ignores the extra keys. `--remote` clones also get
+`core.hooksPath` in their own config before the first checkout.
+
+The second catches what no override list can enumerate. `credential.helper`,
+`core.sshCommand`, an `include.path`, diff and filter drivers — any of these
+written by repository code would run inside the orchestrator's push with our
+credentials. So the clone's effective config (`git config --list --includes`)
+is recorded before the first fix agent in it runs, and compared after every
+fix-agent run and again before every commit or push, since the build check in
+between executes repository code too. Any difference fails the alert — and,
+because the baseline is per clone, every later alert in that clone — before the
+next git command. What it cannot see is a change made and reverted between two
+checks, or one outside git's config (a `~/.ssh/config` edit, say).
+
 The `git-setup` subcommand, which only a human runs by hand, is left as it was.
-`--remote` clones also get the setting in their own config before the first
-checkout. The trade-off is deliberate: repo-local hooks — formatters, linters,
+The trade-off is deliberate: repo-local hooks — formatters, linters,
 commit-message checks — no longer run on bot commits, so whatever they enforce
-is left to CI (gate 5) and the Orca check (gate 4). Other config keys that can
-name a command (`core.fsmonitor`, `core.sshCommand`, diff and filter drivers) are
-not overridden; a clone does not carry them, so they would have to be written by
-code running during the fix.
+is left to CI (gate 5) and the Orca check (gate 4).
 
 **Only declared files are committed.** Staging was `git add -A`, so anything the
 fix agent's Bash left behind that `.gitignore` did not cover — a scratch file, a

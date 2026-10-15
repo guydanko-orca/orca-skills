@@ -66,16 +66,35 @@ _SCRUB = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
 # reviewed here rather than configured.
 _NEVER = {"ORCA_API_TOKEN", "ORCA_AUTH_TOKEN", "NOTIFY_WEBHOOK_URL",
               "GH_TOKEN", "GITHUB_TOKEN"}
+# Every hook event in githooks(5) as of git 2.56. Config-defined hooks
+# (`hook.<name>.command`, git >= 2.54) do not live in core.hooksPath, so each
+# event is switched off by name. Older git has no config hooks and ignores the
+# unknown keys — checked against Apple git 2.50.
+_HOOK_EVENTS = (
+    "applypatch-msg", "pre-applypatch", "post-applypatch", "pre-commit",
+    "pre-merge-commit", "prepare-commit-msg", "commit-msg", "post-commit",
+    "pre-rebase", "post-checkout", "post-merge", "pre-push", "pre-receive",
+    "update", "proc-receive", "post-receive", "post-update",
+    "reference-transaction", "push-to-checkout", "pre-auto-gc", "post-rewrite",
+    "sendemail-validate", "fsmonitor-watchman", "p4-changelist",
+    "p4-prepare-changelist", "p4-post-changelist", "p4-pre-submit",
+    "post-index-change",
+)
+
 # Every git command the plugin runs where a hook can fire. `git commit` and
 # `git push` run the repository's hooks — husky, pre-commit, pre-push — with the
 # orchestrator's environment, which holds the Orca token and whatever `gh` is
 # authenticated with. In single-repo mode those are the operator's own hooks,
 # live; and a lockfile regen that executes repository code (`bundle lock`
-# evaluates the Gemfile) can rewrite core.hooksPath in the shared .git/config
-# mid-run. A command-line -c outranks every config file, so this holds whatever
-# the clone's config says. The cost: repo-local hooks no longer run on bot
-# commits, so anything they enforce is left to CI and the Orca check.
-HOOKLESS_GIT = ["git", "-c", "core.hooksPath=/dev/null"]
+# evaluates the Gemfile) can rewrite the shared .git/config mid-run. A
+# command-line -c outranks every config file, so this holds whatever the clone's
+# config says about hooks and fsmonitor; other command-running keys
+# (credential.helper, core.sshCommand) are caught by the orchestrator's config
+# drift check instead. The cost: repo-local hooks no longer run on bot commits,
+# so anything they enforce is left to CI and the Orca check.
+HOOKLESS_GIT = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                *(arg for event in _HOOK_EVENTS
+                  for arg in ("-c", f"hook.{event}.enabled=false"))]
 
 _NEVER_SHAPE = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|SESSION",
                               re.IGNORECASE)

@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -255,6 +256,14 @@ class TestAlertPathsCannotEscapeTheWorktree(unittest.TestCase):
         self.assertIn("resolve_within(worktree_path, manifest_rel)", src)
 
 
+def _git_version() -> tuple:
+    import re
+    import subprocess
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
 class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
     """`git commit` and `git push` run the repository's hooks — husky,
     pre-commit, pre-push — with this process's credentials in the environment.
@@ -300,6 +309,17 @@ class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
         # Installed last, the way husky's `prepare` script would, so the setup
         # commits above leave no markers behind.
         git("config", "core.hooksPath", str(hooks), cwd=self.work)
+        # Two more ways config alone runs a command, neither reached by
+        # core.hooksPath: config-defined hooks (git >= 2.54) and an fsmonitor.
+        for event in self.HOOKS:
+            git("config", "--add", "hook.planted.event", event, cwd=self.work)
+        git("config", "hook.planted.command",
+            # `; :` swallows the hook arguments git appends to a oneliner.
+            f"touch '{self.markers / 'config-hook'}'; :", cwd=self.work)
+        fsmonitor = base / "fsmonitor"
+        fsmonitor.write_text(f"#!/bin/sh\ntouch '{self.markers / 'fsmonitor'}'\nexit 1\n")
+        fsmonitor.chmod(0o755)
+        git("config", "core.fsmonitor", str(fsmonitor), cwd=self.work)
         self.cwd = os.getcwd()
         os.chdir(self.work)
 
@@ -317,6 +337,9 @@ class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
         self.git("commit", "-q", "-am", "plain", cwd=self.work)
         self.assertIn("pre-commit", self.fired())
         self.assertIn("post-commit", self.fired())
+        self.assertIn("fsmonitor", self.fired())
+        if _git_version() >= (2, 54):
+            self.assertIn("config-hook", self.fired())
 
     def test_commit_push_and_retry_push_run_no_hook(self):
         import argparse
@@ -383,6 +406,78 @@ class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
                 self.assertIn("HOOKLESS_GIT", src)
 
 
+class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
+    """Overriding hooks per command covers the keys we know about. A fix agent's
+    regen runs repository code that can write any git config — credential.helper,
+    core.sshCommand, an include.path — and the orchestrator's git then runs with
+    our credentials. So the effective config is compared across every fix-agent
+    run, and any change fails the alert before plugin git touches the tree."""
+
+    def setUp(self):
+        import subprocess
+        self._tmp = tempfile.TemporaryDirectory()
+        self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
+                                           "GIT_CONFIG_NOSYSTEM": "1"})
+        self.env.start()
+        self.work = Path(self._tmp.name) / "work"
+        self.git = lambda *a: subprocess.run(
+            ["git", *a], cwd=self.work, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.work)], check=True)
+        self.included = Path(self._tmp.name) / "included.cfg"
+        self.included.write_text("[user]\n\tname = t\n")
+        self.git("config", "include.path", str(self.included))
+
+    def tearDown(self):
+        self.env.stop()
+        self._tmp.cleanup()
+
+    def test_unchanged_config_is_not_drift(self):
+        before = orchestrator._git_config_snapshot(self.work)
+        self.assertTrue(before)
+        self.assertEqual(orchestrator._config_drift(self.work, before), "")
+
+    def test_each_kind_of_rewrite_is_caught(self):
+        for desc, change in (
+                ("credential helper", lambda: self.git("config", "credential.helper", "!evil")),
+                ("ssh command", lambda: self.git("config", "core.sshCommand", "evil")),
+                ("config hook", lambda: self.git("config", "hook.x.command", "evil")),
+                ("included file", lambda: self.included.write_text(
+                    "[core]\n\tfsmonitor = evil\n"))):
+            with self.subTest(desc):
+                before = orchestrator._git_config_snapshot(self.work)
+                change()
+                self.assertIn("git config changed",
+                              orchestrator._config_drift(self.work, before), desc)
+
+    def test_a_config_change_fails_the_alert_before_any_gate(self):
+        from orca_client import Repository
+        task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                         feature_type="sast", source="app.py:1", alert_json={})
+
+        def agent(*_a, **_kw):
+            self.git("config", "credential.helper", "!evil")
+            return FixAgentResult(success=True, files_changed=["app.py"])
+
+        with patch("orchestrator._create_worktree", return_value=self.work), \
+             patch("orchestrator._remove_worktree"), \
+             patch("orchestrator._invoke_fix_agent", side_effect=agent), \
+             patch("orchestrator.sanity_check") as sanity:
+            result = orchestrator.run_one(task, dry_run=False,
+                                          notifier=unittest.mock.MagicMock(),
+                                          repo=Repository(name="o/r", url="u"))
+        self.assertEqual(result.state, "FAILED")
+        self.assertIn("git config changed", result.failure_reason)
+        sanity.assert_not_called()
+
+    def test_every_fix_agent_run_and_every_push_is_checked(self):
+        """After each agent run, and before each commit or push — the build check
+        between them runs repository code as well."""
+        src = __import__("inspect").getsource(orchestrator._run_pipeline)
+        guarded = (src.count("_invoke_fix_agent(") + src.count("_commit_and_pr(")
+                   + src.count("_push_fix_update("))
+        self.assertEqual(src.count('config_drifted("'), guarded)
+
+
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -396,6 +491,7 @@ if __name__ == "__main__":
         TestClonedTreesCannotConfigureTheAgent,
         TestAlertPathsCannotEscapeTheWorktree,
         TestRepoHooksDoNotRunOnPluginGit,
+        TestFixAgentCannotRewriteGitConfig,
     ]
 
     _registered = {cls.__name__ for cls in test_classes}
