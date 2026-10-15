@@ -176,7 +176,7 @@ def analyze_impact(
     if result.returncode != 0:
         # claude reports its own failures on stdout, not stderr — see
         # _subprocess_error_detail. Logging stderr alone printed an empty string.
-        detail = redactor(_subprocess_error_detail(result))
+        detail = _subprocess_error_detail(result, redactor=redactor)
         print(f"[WARN] impact analysis failed (exit={result.returncode}): {detail}")
         return ImpactResult(
             level="medium",
@@ -205,7 +205,7 @@ def _parse(raw: str, redactor=None) -> ImpactResult:
 
     data = find_last_json_with_key(text, "level")
     if not data:
-        snippet = redactor(text[:200]) if text else "(empty)"
+        snippet = redactor(text)[:200] if text else "(empty)"
         print(f"[WARN] could not parse impact analysis output: {snippet}")
         return ImpactResult(
             level="medium",

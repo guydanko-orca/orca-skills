@@ -337,6 +337,64 @@ class TestEntropyHeuristicRates(unittest.TestCase):
             f"+++ b/{path}"), "without the alert naming it, it does look random")
 
 
+class TestRedactBeforeTruncate(unittest.TestCase):
+    """Slicing first can cut an echoed credential mid-value, leaving a prefix
+    that no exact candidate matches. Every capped echo redacts, then cuts."""
+
+    FRAGMENT = SECRET[:10]
+
+    def _straddling(self, cut):
+        return "y" * (cut - len(self.FRAGMENT)) + SECRET + " and more text after it"
+
+    def _assert_clean(self, text):
+        self.assertNotIn(self.FRAGMENT, text)
+
+    def test_unrecognised_verdict(self):
+        raw = '{"result": ' + __import__("json").dumps(
+            __import__("json").dumps({"verdict": self._straddling(40)})) + "}"
+        with redirect_stdout(io.StringIO()):
+            result = validator._parse_llm(raw, build_redactor(SECRET_ALERT))
+        self._assert_clean(" ".join(result.failures))
+
+    def test_unparseable_validation_output(self):
+        with redirect_stdout(io.StringIO()) as out:
+            result = validator._parse_llm(self._straddling(200), build_redactor(SECRET_ALERT))
+        self._assert_clean(" ".join(result.failures))
+        self._assert_clean(out.getvalue())
+
+    def test_validation_cli_error(self):
+        with patch.object(validator, "worktree_diff", return_value="d"), \
+             patch.object(validator.subprocess, "run") as run, \
+             redirect_stdout(io.StringIO()):
+            run.return_value.returncode = 1
+            run.return_value.stderr = self._straddling(500)
+            run.return_value.stdout = ""
+            result = validator.llm_validate(SECRET_ALERT, Path("/tmp/x"))
+        self._assert_clean(" ".join(result.failures))
+
+    def test_unparseable_impact_output(self):
+        with patch.object(impact_agent.subprocess, "run") as run, \
+             redirect_stdout(io.StringIO()) as out:
+            run.return_value.returncode = 0
+            run.return_value.stdout = self._straddling(200)
+            result = impact_agent.analyze_impact(SECRET_ALERT, "diff")
+        self._assert_clean(f"{result.error} {result.description} {out.getvalue()}")
+
+    def test_fix_agent_crash(self):
+        task = orchestrator.AlertTask(
+            alert_id="orca-abc123", title="t", risk_level="high",
+            feature_type="secret", source="app.py:14",
+            alert_json=SECRET_ALERT, worktree_path=Path("/tmp/x"))
+        with patch.object(orchestrator.subprocess, "run") as run, \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value="# i"):
+            run.return_value.returncode = 1
+            run.return_value.stdout = ""
+            run.return_value.stderr = self._straddling(300)
+            result = orchestrator._invoke_fix_agent(task, dry_run=False, timeout_sec=5)
+        self._assert_clean(result.failure_reason)
+
+
 class TestRedactor(unittest.TestCase):
     def setUp(self):
         self.r = build_redactor(SECRET_ALERT)

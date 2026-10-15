@@ -92,7 +92,7 @@ your reasoning. Answer directly.
 _SINGLE_SHOT_MAX_TURNS = 1
 
 
-def _subprocess_error_detail(result, limit: int = 500) -> str:
+def _subprocess_error_detail(result, limit: int = 500, redactor=None) -> str:
     """Best available explanation for a failed subprocess.
 
     `claude -p --output-format json` reports its own failures in a JSON envelope
@@ -100,22 +100,28 @@ def _subprocess_error_detail(result, limit: int = 500) -> str:
     "(no stderr)" and threw away the actual cause. Prefer stderr when there is
     one, fall back to stdout, and surface the envelope's subtype when present
     because that is the field that names the failure (e.g. error_max_turns).
+
+    redactor: applied before the cut, never after — a slice can end mid-credential
+              and leave a prefix no exact candidate matches.
     """
+    def cap(text: str) -> str:
+        return (redactor(text) if redactor else text)[:limit]
+
     stderr = (result.stderr or "").strip()
     stdout = (result.stdout or "").strip()
     if stderr:
-        return stderr[:limit]
+        return cap(stderr)
     if not stdout:
         return "(no output)"
     try:
         envelope = json.loads(stdout)
     except json.JSONDecodeError:
-        return stdout[:limit]
+        return cap(stdout)
     if isinstance(envelope, dict):
         subtype = envelope.get("subtype") or envelope.get("error")
         if subtype:
-            return f"{subtype}: {json.dumps(envelope)[:limit]}"
-    return stdout[:limit]
+            return f"{subtype}: {cap(json.dumps(envelope))}"
+    return cap(stdout)
 
 
 def worktree_diff(worktree_path: Path) -> str:
@@ -325,7 +331,7 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
     if result.returncode != 0:
         # The CLI's own failure output can echo the prompt back, so it is an
         # egress path too — the console here, and `failures` onward.
-        detail = redactor(_subprocess_error_detail(result))
+        detail = _subprocess_error_detail(result, redactor=redactor)
         print(f"[WARN] LLM validation failed (exit={result.returncode}): {detail}")
         return _unconfirmed(f"LLM validation errored (exit={result.returncode}): {detail}")
 
@@ -363,7 +369,7 @@ def _parse_llm(raw: str, redactor=None) -> ValidationResult:
 
     data = find_last_json_with_key(text, "verdict") if text else None
     if not data:
-        snippet = redactor(text[:200]) if text else "(empty)"
+        snippet = redactor(text)[:200] if text else "(empty)"
         print(f"[WARN] could not parse LLM validation output: {snippet}")
         return _unconfirmed(f"Could not parse LLM validation response: {snippet}")
 
@@ -380,7 +386,7 @@ def _parse_llm(raw: str, redactor=None) -> ValidationResult:
                                 needs_review=True, failures=concerns)
     if verdict == "pass":
         return ValidationResult(passed=True, phase="llm", outcome="pass")
-    shown = redactor(str(raw_verdict)[:40])
+    shown = redactor(str(raw_verdict))[:40]
     return _unconfirmed(f"LLM validation returned no recognised verdict ({shown!r})")
 
 

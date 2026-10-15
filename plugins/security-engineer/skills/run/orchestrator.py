@@ -576,7 +576,7 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
     if result.returncode != 0:
         return FixAgentResult(
             success=False,
-            failure_reason=redactor(result.stderr[:300]),
+            failure_reason=redactor(result.stderr or "")[:300],
             error_code="subprocess_error",
         )
 
