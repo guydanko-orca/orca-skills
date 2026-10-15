@@ -166,6 +166,35 @@ class TestMaskedSnippetFallsBackToPatterns(unittest.TestCase):
         self.assertIn(f"untrusted-{nonce} id=", preamble(nonce))
         self.assertEqual(out.count(f"untrusted-{nonce}"), prompt.count(f"untrusted-{nonce}"))
 
+    def test_an_unterminated_quote_cannot_swallow_the_prompt(self):
+        """The fallback runs over whole fenced prompts. A value pattern that could
+        cross a newline ran from an unclosed quote in the diff to the next quote
+        anywhere after it — eating the fence's closing tag and the instructions."""
+        diff = '+  token = "abcdefghijklmnop\n+other = 1\n'
+        with patch.object(validator, "worktree_diff", return_value=diff), \
+             patch.object(validator.subprocess, "run") as run, \
+             redirect_stdout(io.StringIO()):
+            run.return_value.returncode = 0
+            run.return_value.stdout = '{"verdict": "pass"}'
+            validator.llm_validate(self._alert(['token = "****"']), Path("/tmp/x"))
+        prompt = run.call_args.kwargs["input"]
+        tag = prompt.split("<untrusted-")[1].split(" ")[0]
+        from untrusted import preamble
+        self.assertEqual(prompt.count(f"</untrusted-{tag}>"),
+                         preamble(tag).count(f"</untrusted-{tag}>") + 2,
+                         "alert_json and diff fences both still close")
+        self.assertIn("Return ONLY this JSON", prompt)
+        self.assertIn('"verdict": "pass|fail|uncertain"', prompt)
+        self.assertIn("+other = 1", prompt)
+
+    def test_no_secret_pattern_matches_across_a_newline(self):
+        import redact
+        for text in ('token = "abcdefgh\nijklmnop"', "Bearer\n" + "A" * 24):
+            for pattern in redact.SECRET_PATTERNS:
+                with self.subTest(text=text[:10], pattern=pattern[:20]):
+                    match = __import__("re").search(pattern, text)
+                    self.assertTrue(match is None or "\n" not in match.group(0))
+
     def test_fallback_reason_carries_no_snippet_content(self):
         r = build_redactor(self._alert(['API_KEY = "sk-li****"']))
         self.assertNotIn("sk-li", r.fallback_reason)

@@ -77,11 +77,14 @@ _BARE_ASSIGNMENT = re.compile(r"""([A-Za-z_][\w.\-]*)\s*=\s*([^\s"'#]{12,})""")
 # Credential shapes, shared with validator.sanity_check, which fails a diff that
 # adds a line matching any of them. The `value` group is what the fallback
 # redacts; the rest of a match — `API_KEY = "`, `Bearer ` — is left in place,
-# since keys are never redacted.
+# since keys are never redacted. No pattern may cross a line break: the fallback
+# runs over whole fenced prompts, and a value class that admits a newline turned
+# one unclosed quote in a diff into a match running to the next quote anywhere
+# after it — the fence's closing tag and the instructions included.
 SECRET_PATTERNS = [
-    r'(?i)(api_?key|password|secret|token)\s*[=:]\s*["\'](?P<value>[^"\']{8,})["\']',
+    r'(?i)(api_?key|password|secret|token)[ \t]*[=:][ \t]*["\'](?P<value>[^"\'\r\n]{8,})["\']',
     r'(?P<value>sk-[A-Za-z0-9]{20,})',
-    r'(?i)bearer\s+(?P<value>[A-Za-z0-9+/]{20,})',
+    r'(?i)bearer[ \t]+(?P<value>[A-Za-z0-9+/]{20,})',
 ]
 _COMPILED_PATTERNS = [re.compile(p) for p in SECRET_PATTERNS]
 
