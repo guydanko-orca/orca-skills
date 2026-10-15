@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _json_util import find_last_json_with_key
-from agent_env import HOOKLESS_GIT, agent_env, build_env, git_env
+from agent_env import SAFE_GIT, agent_env, build_env, credentialed_env, git_env, neutral_dir
 from orca_client import _resolve_feature_type
 from paths import resolve_within
 from redact import SECRET_PATTERNS, build_redactor
@@ -133,9 +133,11 @@ def worktree_diff(worktree_path: Path) -> str:
     shows up, which keeps every gate (sanity, LLM, impact) judging the same set
     of changes the commit will actually contain. Honours .gitignore.
     """
-    subprocess.run([*HOOKLESS_GIT, "add", "-A", "-N"],
+    subprocess.run([*SAFE_GIT, "add", "-A", "-N"],
                    cwd=worktree_path, capture_output=True, text=True, env=git_env())
-    return subprocess.run([*HOOKLESS_GIT, "diff"],
+    # No external diff driver and no textconv: both are commands a clone's
+    # config can name, and the diff is what every gate reads.
+    return subprocess.run([*SAFE_GIT, "diff", "--no-ext-diff", "--no-textconv"],
                           cwd=worktree_path, capture_output=True, text=True,
                           env=git_env()).stdout
 
@@ -547,7 +549,7 @@ def ci_gate(pr_url: str, timeout_sec: int = 600) -> ValidationResult:
     try:
         result = subprocess.run(
             ["gh", "pr", "checks", pr_url, "--watch", "--fail-fast"],
-            capture_output=True, text=True, timeout=timeout_sec, env=git_env(),
+            capture_output=True, text=True, timeout=timeout_sec, env=credentialed_env(), cwd=neutral_dir(),
         )
     except subprocess.TimeoutExpired:
         return ValidationResult(passed=False, phase="ci",
@@ -593,7 +595,7 @@ def _get_pr_head_sha(pr_url: str) -> str:
     """Get the HEAD SHA for a PR using gh CLI."""
     result = subprocess.run(
         ["gh", "pr", "view", pr_url, "--json", "headRefOid", "--jq", ".headRefOid"],
-        capture_output=True, text=True, timeout=30, env=git_env(),
+        capture_output=True, text=True, timeout=30, env=credentialed_env(), cwd=neutral_dir(),
     )
     if result.returncode != 0:
         raise RuntimeError(f"gh pr view failed: {result.stderr[:200]}")
@@ -608,7 +610,7 @@ def _find_orca_check_run(owner_repo: str, sha: str, check_name: str) -> dict | N
     result = subprocess.run(
         ["gh", "api", f"repos/{owner_repo}/commits/{sha}/check-runs",
          "--jq", ".check_runs"],
-        capture_output=True, text=True, timeout=30, env=git_env(),
+        capture_output=True, text=True, timeout=30, env=credentialed_env(), cwd=neutral_dir(),
     )
     if result.returncode != 0:
         return None
@@ -627,7 +629,7 @@ def _get_check_annotations(owner_repo: str, check_run_id: int) -> list[OrcaCheck
     """Fetch annotations for a check run and return structured findings."""
     result = subprocess.run(
         ["gh", "api", f"repos/{owner_repo}/check-runs/{check_run_id}/annotations"],
-        capture_output=True, text=True, timeout=30, env=git_env(),
+        capture_output=True, text=True, timeout=30, env=credentialed_env(), cwd=neutral_dir(),
     )
     if result.returncode != 0:
         return []

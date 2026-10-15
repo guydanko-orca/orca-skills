@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
-from agent_env import HOOKLESS_GIT, git_env
+from agent_env import SAFE_GIT, credentialed_env, git_env, neutral_dir, push_git
 from orca_client import (
     RISK_ORDER,
     _resolve_feature_type,
@@ -34,11 +34,16 @@ from version_data import ecosystem_for_manifest, resolve_bump, resolve_ecosystem
 # Helpers
 # ---------------------------------------------------------------------------
 
-def run(cmd, check=True, capture=True, cwd=None):
-    """Run a shell command. Returns (stdout, stderr, returncode)."""
+def run(cmd, check=True, capture=True, cwd=None, env=None):
+    """Run a command. Returns (stdout, stderr, returncode).
+
+    env defaults to git_env(), which holds no credential; the push, the commit
+    and gh pass credentialed_env() explicitly.
+    """
     result = subprocess.run(
         cmd, shell=isinstance(cmd, str),
-        capture_output=capture, text=True, cwd=cwd, env=git_env()
+        capture_output=capture, text=True, cwd=cwd,
+        env=env if env is not None else git_env()
     )
     if check and result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"Command failed: {cmd}")
@@ -48,7 +53,7 @@ def run(cmd, check=True, capture=True, cwd=None):
 def detect_repo():
     """Detect owner/repo from git remote."""
     try:
-        url, _, _ = run(["git", "remote", "get-url", "origin"])
+        url, _, _ = run([*SAFE_GIT, "remote", "get-url", "origin"])
         if "github.com/" in url:
             return url.split("github.com/")[-1].removesuffix(".git")
         elif "github.com:" in url:
@@ -275,7 +280,7 @@ def cmd_git_setup(args):
 
     try:
         run(["git", "checkout", "main"])
-        run(["git", "pull", "origin", "main"])
+        run(["git", "pull", "origin", "main"], env=credentialed_env())
         _, stderr, rc = run(["git", "checkout", "-b", branch], check=False)
         if rc != 0:
             if "already exists" in stderr:
@@ -306,9 +311,9 @@ def _stage(paths):
     always passes them; the fallback is for a human driving this CLI by hand.
     """
     if not paths:
-        run([*HOOKLESS_GIT, "add", "-A"])
+        run([*SAFE_GIT, "add", "-A"])
         return
-    run([*HOOKLESS_GIT, "add", "--", *paths])
+    run([*SAFE_GIT, "add", "--", *paths])
     leftover = _unaccounted_changes()
     if leftover:
         raise RuntimeError(
@@ -323,7 +328,7 @@ def _unaccounted_changes():
     file the agent changed and did not report, or something its Bash left behind.
     We cannot tell those apart from here, and both are reasons not to push.
     """
-    out, _, _ = run([*HOOKLESS_GIT, "status", "--porcelain", "--untracked-files=all"])
+    out, _, _ = run([*SAFE_GIT, "status", "--porcelain", "--untracked-files=all"])
     leftover = []
     for line in out.splitlines():
         if len(line) < 4:
@@ -341,9 +346,11 @@ def cmd_git_commit(args):
 
     try:
         _stage(getattr(args, "path", None) or [])
-        run([*HOOKLESS_GIT, "commit", "--no-verify", "-m", args.message])
-        # Extract SHA from "1 file changed" line or git log
-        sha, _, _ = run(["git", "rev-parse", "--short", "HEAD"])
+        # Credentialed only for a signing agent; the orchestrator calls this
+        # holding the clone exclusively, right after checking its config.
+        run([*SAFE_GIT, "commit", "--no-verify", "-m", args.message],
+            env=credentialed_env())
+        sha, _, _ = run([*SAFE_GIT, "rev-parse", "--short", "HEAD"])
         print(sha)
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -358,14 +365,22 @@ def cmd_open_pr(args):
         return
 
     try:
-        run([*HOOKLESS_GIT, "push", "--no-verify", "-u", "origin", branch])
+        repo = detect_repo()
+        if not repo:
+            raise RuntimeError("could not read the repository from the origin remote")
+        run([*push_git(), "push", "--no-verify", "-u", "origin", branch],
+            env=credentialed_env())
+        # Named explicitly and run outside the clone: gh otherwise inspects the
+        # repository in its cwd with our credentials and none of push_git's
+        # overrides.
         pr_url, _, _ = run([
             "gh", "pr", "create",
+            "--repo", repo,
             "--title", args.title,
             "--body", args.body,
             "--base", "main",
             "--head", branch
-        ])
+        ], cwd=neutral_dir(), env=credentialed_env())
         print(pr_url)
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)

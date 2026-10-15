@@ -200,7 +200,7 @@ class TestUnaccountedChangesBlockTheCommit(unittest.TestCase):
             run.return_value = ("", "", 0)
             run_agent._stage([])
             self.assertEqual(run.call_args_list[0].args[0],
-                             [*run_agent.HOOKLESS_GIT, "add", "-A"])
+                             [*run_agent.SAFE_GIT, "add", "-A"])
 
 
 class TestClonedTreesCannotConfigureTheAgent(unittest.TestCase):
@@ -308,7 +308,10 @@ class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
         for key, value in (("user.name", "t"), ("user.email", "t@example.com"),
                            ("commit.gpgsign", "false")):
             git("config", key, value, cwd=self.work)
-        git("remote", "add", "origin", str(self.remote), cwd=self.work)
+        # Fetch URL on GitHub, as run_agent reads the repo name from it; pushes
+        # go to the local bare repository.
+        git("remote", "add", "origin", "https://github.com/owner/repo.git", cwd=self.work)
+        git("remote", "set-url", "--push", "origin", str(self.remote), cwd=self.work)
         (self.work / "app.py").write_text("x = 1\n")
         git("add", "app.py", cwd=self.work)
         git("commit", "-q", "-m", "init", cwd=self.work)
@@ -411,7 +414,7 @@ class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
             src = inspect.getsource(fn)
             with self.subTest(fn.__name__):
                 self.assertNotIn('["git", ', src)
-                self.assertIn("HOOKLESS_GIT", src)
+                self.assertIn("SAFE_GIT", src)
 
 
 class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
@@ -490,6 +493,142 @@ class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
         guarded = (src.count("_invoke_fix_agent(") + src.count("_commit_and_pr(")
                    + src.count("_push_fix_update("))
         self.assertEqual(src.count('config_drifted("'), guarded)
+
+
+class TestPlantedGitCommandsGetNoCredentials(unittest.TestCase):
+    """After repository code ran, a clone's config can make a local git call run
+    a command: an external diff, a textconv, a clean filter, an fsmonitor, a
+    credential helper. Plugin git that needs no credential must hand none over.
+
+    This proves what such a command *receives in its environment*. It still runs
+    as the operator with the real HOME; the drift check is what stops it running
+    at all — see TestFixAgentCannotRewriteGitConfig."""
+
+    CANARIES = {"ORCA_API_TOKEN": "canary-orca", "GH_TOKEN": "canary-gh",
+                "GITHUB_TOKEN": "canary-github", "NOTIFY_WEBHOOK_URL": "canary-hook",
+                "ANTHROPIC_API_KEY": "canary-anthropic"}
+
+    def setUp(self):
+        import subprocess
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.markers = base / "markers"
+        self.markers.mkdir()
+        self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
+                                           "GIT_CONFIG_NOSYSTEM": "1", **self.CANARIES})
+        self.env.start()
+        self._saved_snapshot = agent_env._snapshot_path
+        agent_env._reset_git_config_snapshot()
+        self.work = base / "work"
+        self.git = lambda *a, **kw: subprocess.run(
+            ["git", *a], cwd=self.work, capture_output=True, text=True,
+            **({"stdin": subprocess.DEVNULL} if "input" not in kw else {}), **kw)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.work)], check=True)
+        for key, value in (("user.name", "t"), ("user.email", "t@e"),
+                           ("commit.gpgsign", "false")):
+            self.git("config", key, value)
+        (self.work / "app.py").write_text("x = 1\n")
+        self.git("add", "app.py")
+        self.git("commit", "-qm", "init")
+        # Planted after the fact, as repository code during a fix would.
+        for name, passthrough in (("external", False), ("textconv", True),
+                                  ("filter", True), ("fsmonitor", False),
+                                  ("credential", False)):
+            script = base / name
+            body = ('cat "$1"' if name == "textconv" else "cat") if passthrough else "exit 1"
+            script.write_text(f"#!/bin/sh\nenv > '{self.markers}/{name}-$$'\n{body}\n")
+            script.chmod(0o755)
+        for key, value in (("diff.external", base / "external"),
+                           ("diff.planted.textconv", base / "textconv"),
+                           ("filter.planted.clean", base / "filter"),
+                           ("filter.planted.smudge", base / "filter"),
+                           ("core.fsmonitor", base / "fsmonitor"),
+                           ("credential.helper", base / "credential")):
+            self.git("config", key, str(value))
+        (self.work / ".git" / "info").mkdir(exist_ok=True)
+        (self.work / ".git" / "info" / "attributes").write_text(
+            "* filter=planted diff=planted\n")
+        (self.work / "app.py").write_text("x = 2\n")
+
+    def tearDown(self):
+        self.env.stop()
+        agent_env._snapshot_path = self._saved_snapshot
+        self._tmp.cleanup()
+
+    def _fired(self):
+        return {p.name.split("-")[0]: p.read_text() for p in self.markers.iterdir()}
+
+    def _clear(self):
+        for path in self.markers.iterdir():
+            path.unlink()
+
+    def test_the_planted_commands_do_fire_with_credentials_on_plain_git(self):
+        """Positive control: each planted command runs, and sees the canaries."""
+        self.git("diff")
+        self.git("diff", "--no-ext-diff")
+        self.git("status")
+        self.git("credential", "fill", input="protocol=https\nhost=example.com\n\n",
+                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        fired = self._fired()
+        for name in ("external", "textconv", "filter", "fsmonitor", "credential"):
+            with self.subTest(name):
+                self.assertIn(name, fired)
+                self.assertIn("canary-gh", fired[name])
+
+    def test_plugin_git_hands_planted_commands_no_credential(self):
+        validator.worktree_diff(self.work)
+        orchestrator._local_branch_exists("main", str(self.work))
+        orchestrator._revert(self.work)
+        fired = self._fired()
+        for name in ("external", "textconv", "fsmonitor", "credential"):
+            with self.subTest(name):
+                self.assertNotIn(name, fired, f"{name} ran at all")
+        self.assertIn("filter", fired, "filters are not overridden (LFS needs them)")
+        for name, dump in fired.items():
+            for canary in self.CANARIES.values():
+                with self.subTest(command=name, canary=canary):
+                    self.assertNotIn(canary, dump)
+
+    def test_the_push_prefix_runs_only_the_operators_credential_helpers(self):
+        """`credential.helper=` empties the list — generic and URL-scoped helpers
+        from every config file — and the snapshot's are added back."""
+        import subprocess
+        base = Path(self._tmp.name)
+        good = base / "good-helper"
+        good.write_text(f"#!/bin/sh\ntouch '{self.markers}/good-$$'\nexit 0\n")
+        good.chmod(0o755)
+        operator = base / "operator.cfg"
+        operator.write_text(f'[credential "https://example.com"]\n\thelper = {good}\n')
+        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(operator)}):
+            agent_env._reset_git_config_snapshot()
+            agent_env.git_config_snapshot()
+        self.git("config", "credential.https://example.com.helper", str(base / "credential"))
+        subprocess.run([*agent_env.push_git(), "credential", "fill"], cwd=self.work,
+                       input="protocol=https\nhost=example.com\n\n", capture_output=True,
+                       text=True, env=agent_env.credentialed_env())
+        fired = self._fired()
+        self.assertIn("good", fired)
+        self.assertNotIn("credential", fired)
+
+    def test_credentialed_calls_still_withhold_orca_and_model_credentials(self):
+        env = agent_env.credentialed_env()
+        self.assertIn("GH_TOKEN", env, "gh and push need GitHub's")
+        for name in ("ORCA_API_TOKEN", "NOTIFY_WEBHOOK_URL", "ANTHROPIC_API_KEY"):
+            self.assertNotIn(name, env)
+
+    def test_every_gh_call_runs_outside_the_clone_with_a_named_repo(self):
+        import inspect
+        import re
+
+        import run_agent
+        for module in (orchestrator, validator, run_agent):
+            src = inspect.getsource(module)
+            for call in re.finditer(r'\[\s*"gh",', src):
+                window = src[call.start():call.start() + 500]
+                with self.subTest(module=module.__name__, at=call.start()):
+                    self.assertIn("neutral_dir()", window)
+                    self.assertIn("credentialed_env()", window)
+        self.assertIn('"--repo", repo', inspect.getsource(run_agent.cmd_open_pr))
 
 
 class TestConfigGuardFailsClosed(unittest.TestCase):
@@ -667,6 +806,7 @@ if __name__ == "__main__":
         TestAlertPathsCannotEscapeTheWorktree,
         TestRepoHooksDoNotRunOnPluginGit,
         TestFixAgentCannotRewriteGitConfig,
+        TestPlantedGitCommandsGetNoCredentials,
         TestConfigGuardFailsClosed,
         TestGitConfigIsReadOnceAtStart,
     ]

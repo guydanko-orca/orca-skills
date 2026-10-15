@@ -343,6 +343,34 @@ git 2.54+) that `core.hooksPath` never reaches. Commit and push add
 2.54 has no config hooks and ignores the extra keys. `--remote` clones also get
 `core.hooksPath` in their own config before the first checkout.
 
+Each git call also gets only the privilege it needs. Local calls — add, diff,
+status, worktree, branch, reset/checkout/clean — run through
+`agent_env.SAFE_GIT`, which adds an empty credential helper and askpass, an ssh
+that cannot run, `protocol.allow=never`, no global attributes file and no
+external diff; the diff the gates read is `git diff --no-ext-diff
+--no-textconv`. They run with `git_env()`: the build-check allowlist, so no
+GitHub, Orca, Claude or webhook credential. A planted textconv, external diff,
+fsmonitor or credential helper does not run on them at all; a planted clean or
+smudge filter does — filters are not overridden, because LFS needs them — and
+receives none of those variables. Tested with canaries in a real repository.
+That is all it proves: the command still runs as the operator with the real
+`HOME`, so it could read `~/.config/gh` or run `gh auth token`. What stops it is
+the drift check below, not the environment.
+
+Only the push, the commit (a signing agent may need its socket) and gh get
+credentials (`credentialed_env()`, which still drops the Orca token, the webhook
+and Claude's credentials). The push runs through `push_git()`: the operator's
+credential helpers, ssh command and askpass are taken from the snapshot, after
+`credential.helper=` has emptied every helper any config file named — verified
+with `git credential fill` that a helper planted in the repository, generic or
+URL-scoped, does not run. `url.*.insteadOf` cannot be reset that way, since its
+keys are named by URL, and has not been exercised against a live push. Every gh
+call names its repository (`--repo`, or a PR URL) and runs from a plugin-owned
+directory that is not a repository, because gh inspects the repository in its
+cwd with our credentials and none of the overrides above. A partial clone, which
+fetches objects lazily, cannot work with `protocol.allow=never` and fails rather
+than fetching.
+
 The second catches what no override list can enumerate. `credential.helper`,
 `core.sshCommand`, an `include.path`, diff and filter drivers — any of these
 written by repository code would run inside the orchestrator's push with our

@@ -26,7 +26,16 @@ sys.path.insert(0, str(_SKILLS_DIR / "lib"))
 sys.path.insert(0, str(_THIS_DIR))
 
 from _json_util import find_last_json_with_key
-from agent_env import HOOKLESS_GIT, agent_env, git_config_snapshot, git_env
+from agent_env import (
+    SAFE_GIT,
+    agent_env,
+    credentialed_env,
+    git_config_snapshot,
+    git_env,
+    neutral_dir,
+    push_git,
+    run_env,
+)
 from config import load_config
 from impact_agent import ImpactResult, analyze_impact
 from notifier import NotificationPayload, build_notifiers
@@ -150,10 +159,13 @@ class AlertTask:
 # Subprocess helper
 # ---------------------------------------------------------------------------
 
-def _run(cmd: list[str], check: bool = True, cwd: Path | None = None) -> tuple[str, str, int]:
-    # git_env(): every git and gh call — and run_agent.py, which makes more —
-    # reads the plugin's snapshot of the global git config, never ~/.gitconfig.
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=git_env())
+def _run(cmd: list[str], check: bool = True, cwd: Path | None = None,
+         env: dict | None = None) -> tuple[str, str, int]:
+    """env defaults to run_env(): everything, for run_agent.py's Orca calls, but
+    reading the plugin's snapshot of the global git config, never ~/.gitconfig.
+    Git and gh callers pass git_env() or credentialed_env() instead."""
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd,
+                       env=env if env is not None else run_env())
     if check and r.returncode != 0:
         # Fall back to stdout before giving up on a message. run_agent.py reports
         # failures as JSON on stdout ({"error": "Alert … not found"}) and writes
@@ -188,7 +200,7 @@ def _worktree_path(alert_id: str, repo: Repository | None = None) -> Path:
 
 
 def _local_branch_exists(branch: str, cwd: str | None) -> bool:
-    r = subprocess.run(["git", "rev-parse", "--verify", "--quiet",
+    r = subprocess.run([*SAFE_GIT, "rev-parse", "--verify", "--quiet",
                         f"refs/heads/{branch}"],
                        capture_output=True, text=True, cwd=cwd, env=git_env())
     return r.returncode == 0
@@ -201,7 +213,7 @@ def _branch_has_own_commits(branch: str, cwd: str | None) -> bool:
     a human's branch, or a crashed run that got as far as committing. Anything we
     cannot inspect counts as having commits, so we never force-delete blindly.
     """
-    r = subprocess.run(["git", "rev-list", "--count", f"{BASE_BRANCH}..{branch}"],
+    r = subprocess.run([*SAFE_GIT, "rev-list", "--count", f"{BASE_BRANCH}..{branch}"],
                        capture_output=True, text=True, cwd=cwd, env=git_env())
     if r.returncode != 0:
         return True
@@ -226,11 +238,11 @@ def _create_worktree(alert_id: str, branch: str, repo: Repository | None = None)
     cwd = str(repo.clone_path) if (repo and repo.clone_path) else None
 
     # Drop registrations whose directories no longer exist.
-    subprocess.run([*HOOKLESS_GIT, "worktree", "prune"], capture_output=True, cwd=cwd,
+    subprocess.run([*SAFE_GIT, "worktree", "prune"], capture_output=True, cwd=cwd,
                    env=git_env())
 
     if path.exists():
-        subprocess.run([*HOOKLESS_GIT, "worktree", "remove", "--force", str(path)],
+        subprocess.run([*SAFE_GIT, "worktree", "remove", "--force", str(path)],
                        capture_output=True, cwd=cwd, env=git_env())
         if path.exists():
             # Not a registered worktree of this repo — e.g. the clone it belonged
@@ -246,11 +258,11 @@ def _create_worktree(alert_id: str, branch: str, repo: Repository | None = None)
             raise WorktreeConflict(
                 f"local branch {branch} has commits not in {BASE_BRANCH} — "
                 f"left untouched for review")
-        subprocess.run([*HOOKLESS_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd,
+        subprocess.run([*SAFE_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd,
                        env=git_env())
 
-    _, stderr, rc = _run([*HOOKLESS_GIT, "worktree", "add", "-b", branch, str(path),
-                          BASE_BRANCH], check=False, cwd=cwd)
+    _, stderr, rc = _run([*SAFE_GIT, "worktree", "add", "-b", branch, str(path),
+                          BASE_BRANCH], check=False, cwd=cwd, env=git_env())
     if rc != 0:
         msg = stderr.strip() or f"git worktree add failed (exit {rc})"
         if "already used by worktree" in msg or "already exists" in msg:
@@ -267,15 +279,15 @@ def _remove_worktree(path: Path | None, branch: str | None = None,
     """
     cwd = str(repo.clone_path) if (repo and repo.clone_path) else None
     if path and path.exists():
-        subprocess.run([*HOOKLESS_GIT, "worktree", "remove", "--force", str(path)],
+        subprocess.run([*SAFE_GIT, "worktree", "remove", "--force", str(path)],
                        capture_output=True, cwd=cwd, env=git_env())
     if branch:
-        subprocess.run([*HOOKLESS_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd,
+        subprocess.run([*SAFE_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd,
                        env=git_env())
 
 
 # The effective git config of each clone, as recorded before any repository
-# code ran in it. HOOKLESS_GIT overrides the keys known to run commands from a
+# code ran in it. SAFE_GIT overrides the keys known to run commands from a
 # hook; this catches the rest — credential.helper, core.sshCommand, an
 # include.path — which code run by a fix agent's regen or a build check could
 # write, and which the orchestrator's push would then run with our credentials.
@@ -787,7 +799,7 @@ def _ensure_label(owner_repo: str, label: str) -> None:
     r = subprocess.run(
         ["gh", "label", "create", label, "--repo", owner_repo,
          "--color", color, "--description", description, "--force"],
-        capture_output=True, text=True, env=git_env(),
+        capture_output=True, text=True, env=credentialed_env(), cwd=neutral_dir(),
     )
     if r.returncode != 0:
         print(f"[WARN] could not create label {label} in {owner_repo}: {r.stderr[:200]}")
@@ -804,7 +816,8 @@ def _add_label(pr_url: str, label: str) -> None:
     if owner_repo:
         _ensure_label(owner_repo, label)
     r = subprocess.run(["gh", "pr", "edit", pr_url, "--add-label", label],
-                       capture_output=True, text=True, env=git_env())
+                       capture_output=True, text=True, env=credentialed_env(),
+                       cwd=neutral_dir())
     if r.returncode != 0:
         print(f"[WARN] failed to add {label} label: {r.stderr[:200]}")
 
@@ -918,7 +931,8 @@ def _sync_pr_body(task: AlertTask) -> None:
     if body == task.pr_body:
         return
     r = subprocess.run(["gh", "pr", "edit", task.pr_url, "--body", body],
-                       capture_output=True, text=True, env=git_env())
+                       capture_output=True, text=True, env=credentialed_env(),
+                       cwd=neutral_dir())
     if r.returncode != 0:
         print(f"[WARN] could not update PR body with review reasons: {r.stderr[:200]}")
         return
@@ -983,9 +997,14 @@ def _push_fix_update(task: AlertTask) -> None:
     the same worktree, so it can leave the same debris behind.
     """
     commit_msg = f"fix(security): retry fix for {task.alert_id}"
-    _run([*HOOKLESS_GIT, "add", "--", *_declared_paths(task)], cwd=task.worktree_path)
-    _run([*HOOKLESS_GIT, "commit", "--no-verify", "-m", commit_msg], cwd=task.worktree_path)
-    _run([*HOOKLESS_GIT, "push", "--no-verify"], cwd=task.worktree_path)
+    _run([*SAFE_GIT, "add", "--", *_declared_paths(task)], cwd=task.worktree_path,
+         env=git_env())
+    # Credentialed from here: a signed commit needs the signing agent. The caller
+    # holds the clone exclusively and has just checked its config.
+    _run([*SAFE_GIT, "commit", "--no-verify", "-m", commit_msg], cwd=task.worktree_path,
+         env=credentialed_env())
+    _run([*push_git(), "push", "--no-verify"], cwd=task.worktree_path,
+         env=credentialed_env())
 
 
 # ---------------------------------------------------------------------------
@@ -1000,9 +1019,9 @@ def _revert(worktree_path: Path) -> None:
     would still show a diff. `git clean -fd` honours .gitignore, so ignored build
     artefacts (node_modules, vendor) survive.
     """
-    for cmd in ([*HOOKLESS_GIT, "reset", "-q"],
-                [*HOOKLESS_GIT, "checkout", "--", "."],
-                [*HOOKLESS_GIT, "clean", "-fdq"]):
+    for cmd in ([*SAFE_GIT, "reset", "-q"],
+                [*SAFE_GIT, "checkout", "--", "."],
+                [*SAFE_GIT, "clean", "-fdq"]):
         subprocess.run(cmd, cwd=worktree_path, capture_output=True, env=git_env())
 
 
@@ -1448,7 +1467,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
 def _detect_repo() -> Repository | None:
     """Auto-detect the current repo from git remote and return a Repository object."""
     try:
-        stdout, _, _ = _run(["git", "remote", "get-url", "origin"], check=False)
+        stdout, _, _ = _run([*SAFE_GIT, "remote", "get-url", "origin"], check=False,
+                            env=git_env())
         url = stdout.strip()
         for sep in ("github.com/", "github.com:"):
             if sep in url:
@@ -1785,9 +1805,9 @@ def _clone_repo(repo: Repository) -> Repository:
         shutil.rmtree(path)
     # --config lands in the clone's own .git/config before the checkout, so the
     # clone's checkout and every later git call in it start hookless; the
-    # per-command HOOKLESS_GIT still wins if something rewrites that file.
+    # per-command SAFE_GIT still wins if something rewrites that file.
     _run(["gh", "repo", "clone", repo.url, str(path), "--", "--depth=1",
-          "--config", "core.hooksPath=/dev/null"])
+          "--config", "core.hooksPath=/dev/null"], cwd=neutral_dir(), env=credentialed_env())
     repo.clone_path = path
     return repo
 
@@ -1883,7 +1903,8 @@ def _print_global_summary(all_results: dict, dry_run: bool = False) -> None:
 
 def _get_repo_url(repo_name: str) -> str:
     """Resolve the clone URL for an owner/repo via gh CLI."""
-    stdout, _, _ = _run(["gh", "repo", "view", repo_name, "--json", "url", "--jq", ".url"])
+    stdout, _, _ = _run(["gh", "repo", "view", repo_name, "--json", "url", "--jq", ".url"],
+                        cwd=neutral_dir(), env=credentialed_env())
     return stdout.strip()
 
 

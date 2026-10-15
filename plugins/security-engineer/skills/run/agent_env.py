@@ -248,6 +248,86 @@ def isolate_git_config(env: dict) -> dict:
     return env
 
 
-def git_env() -> dict:
-    """The orchestrator's environment for git and gh, with the snapshot config."""
+def run_env() -> dict:
+    """The full environment, isolated: for run_agent.py, which calls the Orca API."""
     return isolate_git_config(dict(os.environ))
+
+
+# Not needed by git or gh: the Orca API token, the webhook, Claude's own auth.
+_NOT_FOR_GIT = {"ORCA_API_TOKEN", "ORCA_AUTH_TOKEN", "NOTIFY_WEBHOOK_URL"}
+
+
+def credentialed_env() -> dict:
+    """For the calls that need GitHub credentials — push, commit (signing), gh."""
+    env = {k: v for k, v in run_env().items()
+           if k not in _NOT_FOR_GIT and not k.startswith(_MODEL_ONLY_PREFIXES)}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def git_env() -> dict:
+    """For every git call that needs no credentials: the build-check allowlist.
+
+    After repository code has run, a clone's config can name commands git runs
+    on a local operation — a clean filter on `git add`, a textconv on `git
+    diff`. Whatever runs that way gets this environment: no GitHub, Orca, Claude
+    or webhook credential. It still runs as the operator with the real HOME, so
+    it is not a sandbox — the config drift check, made before these calls, is
+    what keeps a planted command from running at all.
+    """
+    env = isolate_git_config(build_env())
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+# Local git calls — add, diff, status, commit, reset, checkout, worktree,
+# branch — need no network and no credential, so every way config can make them
+# reach for one is switched off: no credential helper, no askpass, an ssh that
+# cannot run, no transport at all, no global attributes file, no external diff.
+SAFE_GIT = [*HOOKLESS_GIT,
+            "-c", "credential.helper=", "-c", "core.askPass=",
+            "-c", "core.sshCommand=false", "-c", "protocol.allow=never",
+            "-c", "core.attributesFile=/dev/null", "-c", "diff.external="]
+
+_CREDENTIAL_HELPER = re.compile(r"^credential(\..+)?\.helper$")
+
+
+def _snapshot_values(pattern) -> list[tuple[str, str]]:
+    r = subprocess.run(["git", "config", "--file", git_config_snapshot(), "--list", "-z"],
+                       capture_output=True, text=True, check=True)
+    entries = [raw.partition("\n") for raw in r.stdout.split("\0") if raw]
+    return [(key, value) for key, _, value in entries if pattern.match(key)]
+
+
+def push_git() -> list[str]:
+    """The git prefix for a push: the operator's own credential and ssh setup,
+    from the snapshot, and nothing a clone's config added.
+
+    `credential.helper=` empties the helper list — every helper, URL-scoped or
+    not, from every file read before the command line — and the snapshot's
+    helpers are then added back in their own order. Verified with
+    `git credential fill`: a helper planted in the repository config, generic or
+    URL-scoped, does not run. url.*.insteadOf cannot be reset this way, because
+    its keys are named by URL; a planted one is caught by the drift check made
+    immediately before the push.
+    """
+    prefix = [*HOOKLESS_GIT, "-c", "credential.helper="]
+    for key, value in _snapshot_values(_CREDENTIAL_HELPER):
+        prefix += ["-c", f"{key}={value}"]
+    ssh = [v for _k, v in _snapshot_values(re.compile(r"^core\.sshcommand$"))]
+    askpass = [v for _k, v in _snapshot_values(re.compile(r"^core\.askpass$"))]
+    prefix += ["-c", f"core.sshCommand={ssh[-1] if ssh else 'ssh'}",
+               "-c", f"core.askPass={askpass[-1] if askpass else ''}",
+               "-c", "http.extraHeader=",
+               "-c", "core.attributesFile=/dev/null", "-c", "diff.external="]
+    return prefix
+
+
+def neutral_dir() -> str:
+    """A directory that is not a repository, for gh to run in.
+
+    gh inspects the git repository in its working directory — remotes, branch,
+    uncommitted changes — with our credentials and none of the overrides above.
+    Every gh call names its repository explicitly and runs here instead.
+    """
+    return os.path.dirname(git_config_snapshot())
