@@ -486,13 +486,22 @@ class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
         self.assertIn("git config changed", result.failure_reason)
         sanity.assert_not_called()
 
-    def test_every_fix_agent_run_and_every_push_is_checked(self):
-        """After each agent run, and before each commit or push — the build check
-        between them runs repository code as well."""
+    def test_every_step_after_repository_code_is_checked(self):
+        """Repository code (agent, build check) runs shared; every git step after
+        it runs inside checked(), which holds the clone exclusively and proves
+        the config unchanged first."""
+        import re
         src = __import__("inspect").getsource(orchestrator._run_pipeline)
-        guarded = (src.count("_invoke_fix_agent(") + src.count("_commit_and_pr(")
-                   + src.count("_push_fix_update("))
-        self.assertEqual(src.count('config_drifted("'), guarded)
+        for call in ("_invoke_fix_agent(", "pipeline.verify("):
+            for m in re.finditer(re.escape(call), src):
+                with self.subTest(call=call, at=m.start()):
+                    self.assertIn("with gate.shared():", src[max(0, m.start() - 80):m.start()])
+        for step in ("_revert(task.worktree_path)", "worktree_diff(task.worktree_path)",
+                     "_get_diff(task.worktree_path)", "_commit_and_pr(task",
+                     "_push_fix_update(task)"):
+            for m in re.finditer(re.escape(step), src):
+                with self.subTest(step=step, at=m.start()):
+                    self.assertIn("checked(", src[max(0, m.start() - 80):m.start()])
 
 
 class TestPlantedGitCommandsGetNoCredentials(unittest.TestCase):
@@ -631,6 +640,317 @@ class TestPlantedGitCommandsGetNoCredentials(unittest.TestCase):
         self.assertIn('"--repo", repo', inspect.getsource(run_agent.cmd_open_pr))
 
 
+class TestPluginGitDoesNotPoisonItsOwnClone(unittest.TestCase):
+    """The drift check compares the clone's config against its baseline, so git
+    the plugin runs itself must not write config: `push -u` records the
+    upstream in .git/config, `worktree add -b` does too under
+    branch.autoSetupMerge=always, and either would poison every alert after."""
+
+    def setUp(self):
+        import subprocess
+        orchestrator._reset_clone_guards()
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        operator = base / "operator.cfg"
+        operator.write_text("[branch]\n\tautoSetupMerge = always\n"
+                            "[user]\n\tname = t\n\temail = t@example.com\n"
+                            "[commit]\n\tgpgsign = false\n")
+        self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(operator),
+                                           "GIT_CONFIG_NOSYSTEM": "1"})
+        self.env.start()
+        self._saved_snapshot = agent_env._snapshot_path
+        agent_env._reset_git_config_snapshot()
+        self.remote = base / "remote.git"
+        self.clone = base / "clone"
+        self.worktree = base / "orca-fix-o-r-orca-1"
+        git = lambda *a, cwd=None: subprocess.run(  # noqa: E731
+            ["git", *a], cwd=cwd, check=True, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL)
+        git("init", "-q", "--bare", "-b", "main", str(self.remote))
+        git("init", "-q", "-b", "main", str(self.clone))
+        git("remote", "add", "origin", "https://github.com/owner/repo.git", cwd=self.clone)
+        git("remote", "set-url", "--push", "origin", str(self.remote), cwd=self.clone)
+        (self.clone / "app.py").write_text("x = 1\n")
+        git("add", "app.py", cwd=self.clone)
+        git("commit", "-qm", "init", cwd=self.clone)
+        git("push", "-q", "origin", "main", cwd=self.clone)
+        self.repo = Repository(name="owner/repo", url="u", clone_path=self.clone)
+        self.cwd = os.getcwd()
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        self.env.stop()
+        agent_env._snapshot_path = self._saved_snapshot
+        orchestrator._reset_clone_guards()
+        self._tmp.cleanup()
+
+    def _assert_unchanged(self, step):
+        with self.subTest(step):
+            self.assertEqual(orchestrator._config_drift(self.clone, self.baseline), "")
+
+    def test_the_whole_git_lifecycle_leaves_the_config_as_it_found_it(self):
+        import argparse
+        import contextlib
+        import io
+
+        import run_agent
+        self.baseline = orchestrator._record_config_baseline(self.repo)
+        with patch("orchestrator._worktree_path", return_value=self.worktree):
+            path = orchestrator._create_worktree("orca-1", "fix/orca-orca-1", repo=self.repo)
+        self._assert_unchanged("worktree add")
+
+        os.chdir(path)
+        (path / "app.py").write_text("x = 2\n")
+        real_run = run_agent.run
+
+        def no_gh(cmd, **kw):
+            if cmd[0] == "gh":
+                return "https://github.com/owner/repo/pull/1", "", 0
+            return real_run(cmd, **kw)
+
+        with patch.object(run_agent, "run", side_effect=no_gh), \
+             contextlib.redirect_stdout(io.StringIO()):
+            run_agent.cmd_git_commit(argparse.Namespace(
+                dry_run=False, alert_id="orca-1", message="fix", path=["app.py"]))
+            self._assert_unchanged("commit")
+            run_agent.cmd_open_pr(argparse.Namespace(
+                dry_run=False, alert_id="orca-1", title="t", body="b"))
+        self._assert_unchanged("push and open PR")
+
+        (path / "app.py").write_text("x = 3\n")
+        task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                         feature_type="sast", source="app.py:1", alert_json={},
+                         worktree_path=path,
+                         fix_result=FixAgentResult(success=True, files_changed=["app.py"]))
+        orchestrator._push_fix_update(task)
+        self._assert_unchanged("retry push")
+        os.chdir(self.cwd)
+
+        orchestrator._remove_worktree(path, "fix/orca-orca-1", repo=self.repo)
+        self._assert_unchanged("teardown")
+
+    def test_a_write_by_plugin_git_inside_a_checked_step_is_absorbed(self):
+        """Writes plugin git makes that cannot be listed in advance (git-lfs
+        records lfs.*.access) are folded into the baseline, since the check
+        before the step passed and no repository code runs while it holds the
+        clone."""
+        import subprocess
+
+        from impact_agent import ImpactResult
+        from validator import ValidationResult
+
+        task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                         feature_type="sast", source="app.py:1", alert_json={})
+
+        def commit_and_pr(t, impact, dry_run):
+            subprocess.run(["git", "config", "lfs.https://example.com/info/lfs.access",
+                            "basic"], cwd=self.clone, check=True)
+            return "https://github.com/owner/repo/pull/1"
+
+        ok = ValidationResult(passed=True, phase="x")
+        with patch("orchestrator._create_worktree", return_value=self.clone), \
+             patch("orchestrator._remove_worktree") as remove, \
+             patch("orchestrator._invoke_fix_agent", return_value=FixAgentResult(
+                 success=True, files_changed=["app.py"], diff_summary="d")), \
+             patch("orchestrator.worktree_diff", return_value="diff"), \
+             patch("orchestrator.sanity_check", return_value=ok), \
+             patch("orchestrator.llm_validate",
+                   return_value=ValidationResult(passed=True, phase="llm", outcome="pass")), \
+             patch("pipelines.base.local_build_check", return_value=ok), \
+             patch("orchestrator.analyze_impact", return_value=ImpactResult(
+                 level="low", description="", downtime_risk=False, requires_deploy=True)), \
+             patch("orchestrator._commit_and_pr", side_effect=commit_and_pr), \
+             patch("orchestrator.orca_check_gate", return_value=ok), \
+             patch("orchestrator.ci_gate", return_value=ok), \
+             patch("orchestrator._add_label"), \
+             patch("orchestrator._sync_pr_body"):
+            result = orchestrator.run_one(task, dry_run=False,
+                                          notifier=unittest.mock.MagicMock(), repo=self.repo)
+        self.assertEqual(result.state, "DONE", result.failure_reason)
+        self.assertFalse(orchestrator._clone_gate(self.repo).poisoned)
+        remove.assert_called_once()
+
+
+class TestCloneGate(unittest.TestCase):
+    """Up to four alerts share a clone. Repository code runs shared; the config
+    check and the git that relies on it run exclusive, so an agent cannot
+    rewrite the config between another alert's check and its push."""
+
+    def test_repository_code_runs_concurrently(self):
+        import threading
+        gate = orchestrator._CloneGate()
+        inside = threading.Barrier(2, timeout=2)
+
+        def agent():
+            with gate.shared():
+                inside.wait()
+
+        threads = [threading.Thread(target=agent) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(3)
+        self.assertFalse(inside.broken, "two shared holders must overlap")
+
+    def test_check_and_push_wait_for_running_agents(self):
+        import threading
+        import time
+        gate = orchestrator._CloneGate()
+        events = []
+        agent_in = threading.Event()
+
+        def agent():
+            with gate.shared():
+                agent_in.set()
+                time.sleep(0.3)
+                events.append("agent done")
+
+        def push():
+            agent_in.wait(2)
+            with gate.exclusive():
+                events.append("push")
+
+        threads = [threading.Thread(target=agent), threading.Thread(target=push)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(3)
+        self.assertEqual(events, ["agent done", "push"])
+
+    def test_a_waiting_push_is_not_starved_by_new_agents(self):
+        import threading
+        import time
+        gate = orchestrator._CloneGate()
+        events = []
+        first_in = threading.Event()
+
+        def first_agent():
+            with gate.shared():
+                first_in.set()
+                time.sleep(0.3)
+
+        def push():
+            with gate.exclusive():
+                events.append("push")
+
+        def late_agent():
+            with gate.shared():
+                events.append("late agent")
+
+        a = threading.Thread(target=first_agent)
+        a.start()
+        first_in.wait(2)
+        w = threading.Thread(target=push)
+        w.start()
+        time.sleep(0.1)          # the push is now waiting
+        late = threading.Thread(target=late_agent)
+        late.start()
+        for t in (a, w, late):
+            t.join(3)
+        self.assertEqual(events, ["push", "late agent"])
+
+
+class TestPoisonedCloneRunsNoMoreGit(unittest.TestCase):
+    """Once a check finds the config changed, nothing else in that clone runs
+    git: not the failing alert's teardown, not a later alert's worktree."""
+
+    def setUp(self):
+        import subprocess
+        orchestrator._reset_clone_guards()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
+                                           "GIT_CONFIG_NOSYSTEM": "1"})
+        self.env.start()
+        self._saved_snapshot = agent_env._snapshot_path
+        agent_env._reset_git_config_snapshot()
+        self.work = Path(self._tmp.name) / "work"
+        subprocess.run(["git", "init", "-q", str(self.work)], check=True)
+        self.repo = Repository(name="o/r", url="u", clone_path=self.work)
+
+    def tearDown(self):
+        self.env.stop()
+        agent_env._snapshot_path = self._saved_snapshot
+        orchestrator._reset_clone_guards()
+        self._tmp.cleanup()
+
+    def _task(self, n):
+        return AlertTask(alert_id=f"orca-{n}", title="t", risk_level="high",
+                         feature_type="sast", source="app.py:1", alert_json={})
+
+    def test_later_alerts_fail_without_touching_git(self):
+        import subprocess
+
+        def poisoning_agent(*_a, **_kw):
+            subprocess.run(["git", "config", "credential.helper", "!evil"],
+                           cwd=self.work, check=True)
+            return FixAgentResult(success=True, files_changed=["app.py"])
+
+        with patch("orchestrator._create_worktree", return_value=self.work) as create, \
+             patch("orchestrator._remove_worktree") as remove_with_git, \
+             patch("orchestrator.assert_disposable"), \
+             patch("orchestrator.shutil.rmtree") as rmtree, \
+             patch("orchestrator._invoke_fix_agent", side_effect=poisoning_agent), \
+             patch("orchestrator.worktree_diff") as diff:
+            first = orchestrator.run_one(self._task(1), dry_run=False,
+                                         notifier=unittest.mock.MagicMock(), repo=self.repo)
+            second = orchestrator.run_one(self._task(2), dry_run=False,
+                                          notifier=unittest.mock.MagicMock(), repo=self.repo)
+        self.assertEqual(first.state, "FAILED")
+        self.assertIn("git config changed", first.failure_reason)
+        self.assertEqual(second.state, "FAILED")
+        self.assertIn("git config changed", second.failure_reason)
+        self.assertEqual(create.call_count, 1, "no worktree for the second alert")
+        diff.assert_not_called()
+        remove_with_git.assert_not_called()
+        rmtree.assert_called_once()
+
+
+class TestRepositoryCodeDoesNotOutliveItsRun(unittest.TestCase):
+    """A child the fix agent or a build check leaves in the background could
+    rewrite the config after the last check. It is killed with its group."""
+
+    def test_a_background_child_is_killed(self):
+        import subprocess
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d) / "late-write"
+            script = f"(sleep 1; touch '{marker}') >/dev/null 2>&1 & echo started"
+            subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+            time.sleep(1.5)
+            self.assertTrue(marker.exists(), "positive control: plain run leaves it")
+            marker.unlink()
+            result = agent_env.run_in_group(["sh", "-c", script])
+            time.sleep(1.5)
+            self.assertEqual(result.stdout, "started\n")
+            self.assertFalse(marker.exists())
+
+    def test_a_timeout_kills_the_whole_group(self):
+        import subprocess
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d) / "late-write"
+            started = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                agent_env.run_in_group(
+                    ["sh", "-c", f"(sleep 1; touch '{marker}') & sleep 5"], timeout=0.3)
+            self.assertLess(time.monotonic() - started, 2)
+            time.sleep(1.2)
+            self.assertFalse(marker.exists())
+
+    def test_it_behaves_like_subprocess_run_otherwise(self):
+        result = agent_env.run_in_group(["cat"], input="hello")
+        self.assertEqual((result.returncode, result.stdout), (0, "hello"))
+        self.assertEqual(agent_env.run_in_group(["sh", "-c", "exit 3"]).returncode, 3)
+        with self.assertRaises(FileNotFoundError):
+            agent_env.run_in_group(["no-such-binary-for-this-test"])
+
+    def test_the_agent_and_the_build_checks_use_it(self):
+        import inspect
+        self.assertIn("run_in_group(", inspect.getsource(orchestrator._invoke_fix_agent))
+        for name in ("_run_check", "_check_python"):
+            self.assertIn("run_in_group(", inspect.getsource(getattr(validator, name)))
+
+
 class TestConfigGuardFailsClosed(unittest.TestCase):
     """A guard that cannot read the config used to compare None with None and
     pass. Every way of not knowing now fails the alert."""
@@ -659,7 +979,10 @@ class TestConfigGuardFailsClosed(unittest.TestCase):
         create.assert_not_called()
 
     def test_an_unreadable_config_after_the_agent_fails_the_alert(self):
-        with patch("orchestrator._git_config_snapshot", side_effect=["cfg", None]), \
+        # Readable for the baseline and the worktree creation, not after the agent.
+        reads = iter(["cfg", "cfg"])
+        with patch("orchestrator._git_config_snapshot",
+                   side_effect=lambda _where: next(reads, None)), \
              patch("orchestrator._create_worktree", return_value=self.root), \
              patch("orchestrator._remove_worktree"), \
              patch("orchestrator._invoke_fix_agent",
@@ -807,6 +1130,10 @@ if __name__ == "__main__":
         TestRepoHooksDoNotRunOnPluginGit,
         TestFixAgentCannotRewriteGitConfig,
         TestPlantedGitCommandsGetNoCredentials,
+        TestPluginGitDoesNotPoisonItsOwnClone,
+        TestCloneGate,
+        TestPoisonedCloneRunsNoMoreGit,
+        TestRepositoryCodeDoesNotOutliveItsRun,
         TestConfigGuardFailsClosed,
         TestGitConfigIsReadOnceAtStart,
     ]

@@ -710,7 +710,7 @@ class TestOrchestratorUsesThePipeline(unittest.TestCase):
         """A plan nobody puts in the prompt is a plan the agent cannot follow."""
         task = _task("cve")
         task.fix_plan = FixPlan(render_directive=lambda nonce: "SET pillow TO 10.0.1")
-        with patch("orchestrator.subprocess.run") as mock_run:
+        with patch("orchestrator.run_in_group") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
                 stdout=json.dumps({"result": json.dumps(
@@ -725,7 +725,7 @@ class TestOrchestratorUsesThePipeline(unittest.TestCase):
     def test_prompt_is_unchanged_without_a_plan(self):
         task = _task("sast")
         task.fix_plan = FixPlan()
-        with patch("orchestrator.subprocess.run") as mock_run:
+        with patch("orchestrator.run_in_group") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
                 stdout=json.dumps({"result": json.dumps(

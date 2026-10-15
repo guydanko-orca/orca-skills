@@ -17,12 +17,15 @@ need those credentials, and they are not the untrusted party — but the hooks a
 repository can attach to them are, so they run through HOOKLESS_GIT.
 """
 import atexit
+import contextlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
+import time
 
 from config import load_config
 
@@ -331,3 +334,74 @@ def neutral_dir() -> str:
     Every gh call names its repository explicitly and runs here instead.
     """
     return os.path.dirname(git_config_snapshot())
+
+
+# ---------------------------------------------------------------------------
+# Repository code runs in a process group that does not outlive it
+# ---------------------------------------------------------------------------
+
+def _kill_group(pgid: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+def _exited(proc) -> bool:
+    """Has the leader exited? Without reaping it where the platform allows."""
+    if hasattr(os, "waitid"):
+        return os.waitid(os.P_PID, proc.pid,
+                         os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None
+    # CPython on macOS before 3.13 has no os.waitid. Reaping here frees the pid,
+    # so the kill that follows has a window of microseconds in which an
+    # unrelated process could have taken that pid and made it a group id.
+    return proc.poll() is not None
+
+
+def run_in_group(cmd, *, input=None, timeout=None, cwd=None, env=None
+                 ) -> subprocess.CompletedProcess:
+    """subprocess.run for the processes that run repository code — the fix
+    agent, whose Bash runs lockfile regens, and the build checks.
+
+    The command gets its own session and process group, and the whole group is
+    killed when the command exits or times out. Without that, a child it left
+    running in the background could rewrite the clone's git config after the
+    last drift check and before the push. Where os.waitid exists the group is
+    killed while the leader is still an unreaped zombie (WNOWAIT), so its id
+    cannot have been reused by an unrelated process; see _exited for where it
+    does not. A child that calls setsid() itself leaves the group and is not
+    caught.
+    """
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else
+                            subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, cwd=cwd, env=env,
+                            start_new_session=True)
+    out: list[str] = []
+    err: list[str] = []
+    readers = [threading.Thread(target=lambda s=stream, sink=sink: sink.append(s.read()),
+                                daemon=True)
+               for stream, sink in ((proc.stdout, out), (proc.stderr, err))]
+    for reader in readers:
+        reader.start()
+    if input is not None:
+        try:
+            proc.stdin.write(input)
+        except BrokenPipeError:
+            pass
+        finally:
+            proc.stdin.close()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    timed_out = False
+    while not _exited(proc):
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
+        time.sleep(0.05)
+    _kill_group(proc.pid)
+    proc.wait()
+    # Bounded: a child that left the group with setsid() and kept the pipe open
+    # would otherwise hold the alert forever. Its late output is dropped.
+    for reader in readers:
+        reader.join(5)
+    stdout, stderr = "".join(out), "".join(err)
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)

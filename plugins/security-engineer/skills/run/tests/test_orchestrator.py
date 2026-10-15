@@ -718,7 +718,7 @@ class TestDryRunEnforcement(unittest.TestCase):
         """In dry-run mode, claude subprocess must receive --allowedTools Read (not Edit/Write/Bash)."""
         task = self._make_task()
 
-        with patch("subprocess.run") as mock_run:
+        with patch("orchestrator.run_in_group") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
                 stdout='{"result": "{\\"status\\": \\"success\\", \\"alert_id\\": \\"orca-test-001\\", \\"files_changed\\": [], \\"diff_summary\\": \\"planned fix\\"}"}',
@@ -745,7 +745,7 @@ class TestDryRunEnforcement(unittest.TestCase):
         `git checkout -- <file>`, which _revert already does, so it gets none."""
         task = self._make_task()
 
-        with patch("subprocess.run") as mock_run:
+        with patch("orchestrator.run_in_group") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
                 stdout='{"result": "{\\"status\\": \\"success\\", \\"alert_id\\": \\"orca-test-001\\", \\"files_changed\\": [], \\"diff_summary\\": \\"fixed\\"}"}',
@@ -1843,7 +1843,7 @@ class TestOrcaCheckRetry(unittest.TestCase):
         orca_retries = orchestrator.CFG.orca_check.max_retries
         self.assertEqual(mock_fix.call_count, 1 + orca_retries)
 
-    @patch("orchestrator.subprocess.run")
+    @patch("orchestrator.run_in_group")
     def test_feedback_in_prompt(self, mock_run):
         """Verify that feedback text appears in the claude subprocess prompt."""
         mock_run.return_value = subprocess.CompletedProcess(

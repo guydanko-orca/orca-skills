@@ -368,7 +368,9 @@ def cmd_open_pr(args):
         repo = detect_repo()
         if not repo:
             raise RuntimeError("could not read the repository from the origin remote")
-        run([*push_git(), "push", "--no-verify", "-u", "origin", branch],
+        # An explicit refspec and no -u: recording the upstream writes the shared
+        # .git/config, which the drift check would then read as tampering.
+        run([*push_git(), "push", "--no-verify", "origin", f"HEAD:refs/heads/{branch}"],
             env=credentialed_env())
         # Named explicitly and run outside the clone: gh otherwise inspects the
         # repository in its cwd with our credentials and none of push_git's

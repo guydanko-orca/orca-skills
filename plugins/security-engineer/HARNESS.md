@@ -378,13 +378,35 @@ credentials. So the clone's effective config (`git config --list --includes`,
 plus `--show-scope` where the installed git has it — probed once, so baseline
 and checks are listed alike) is recorded right after the clone, or locally right
 after the repository is detected, before any repository code runs. It is keyed
-by the clone's path, worked out without running git. It is compared after every
-fix-agent run and again before every commit or push, since the build check in
-between executes repository code too. Any difference fails the alert — and,
-because the baseline is per clone, every later alert in that clone — before the
-next git command. Not being able to tell fails too: if the config cannot be
-listed, for the baseline or for a check, the alert fails closed. What it cannot see is a change made and reverted between two
-checks, or one outside git's config (a `~/.ssh/config` edit, say).
+by the clone's path, worked out without running git. It is checked before every
+git call that follows repository code: after each fix-agent run, before a
+revert, before the diff the gates read, after the build check, before worktree
+creation and teardown, and immediately before every commit and push. Not being
+able to tell fails too: if the config cannot be listed, for the baseline or for
+a check, the alert fails closed.
+
+Up to four alerts share one clone, so a check is only worth something if
+nothing can change the config between it and the git call it guards. Each clone
+has a reader/writer gate (`orchestrator._CloneGate`): fix agents and build
+checks run holding it shared, and every check together with the git that
+follows it — the push included — holds it exclusively, so no agent of another
+alert runs in that window. A waiting writer blocks new readers, so a stream of
+agents cannot starve a push. A detected change poisons the clone. The alert
+fails; every later alert in that clone fails before running any git; and
+worktrees are removed with `rmtree`, not `git worktree remove`. The local
+branches and worktree registrations are then left behind in the poisoned
+clone. Plugin git must not trip its own check: pushes name an explicit refspec
+instead of `-u`, worktrees are added `--no-track` (either would record an
+upstream in the shared config), and after each exclusive hold that ran only
+plugin git the clone's baseline is re-taken, which absorbs writes no list can
+anticipate, such as git-lfs recording `lfs.*.access`. Fix agents and build checks also run in their own process group,
+killed in full when the command exits or times out. A child left in the
+background therefore cannot rewrite the config after the last check. A child
+that calls `setsid()` itself leaves the group and is not caught.
+
+What none of this sees: a change made and reverted between two checks, a
+change outside git's config (a `~/.ssh/config` edit, say), and anything a
+planted command does by reading the operator's files under `HOME`.
 
 The operator's own git configuration is read once, at the start of a run.
 Build checks keep the real `HOME`, so they can write `~/.gitconfig`; under

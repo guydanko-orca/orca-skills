@@ -231,7 +231,7 @@ class TestAlertTextIsFencedInEveryPrompt(unittest.TestCase):
                          feature_type="cve", source="r.txt", alert_json=dict(self.ALERT),
                          worktree_path=Path("/tmp/orca-fix-x"),
                          fix_plan=FixPlan(render_directive=render))
-        with patch("subprocess.run") as run:
+        with patch("orchestrator.run_in_group") as run:
             run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
             _invoke_fix_agent(task, dry_run=False, timeout_sec=5)
         prompt = run.call_args_list[0].kwargs["input"]
@@ -295,7 +295,7 @@ class TestFencingDoesNotBreakRedaction(unittest.TestCase):
                          risk_level="high", feature_type="secret",
                          source="app.py:1", alert_json=self.ALERT,
                          worktree_path=Path("/tmp/orca-fix-x"))
-        with patch("subprocess.run") as run:
+        with patch("orchestrator.run_in_group") as run:
             run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
             with patch.object(Path, "exists", return_value=True), \
                  patch.object(Path, "read_text", return_value="# instructions"):
@@ -354,7 +354,7 @@ class TestToolScope(unittest.TestCase):
                          alert_json={"alert_id": "o-1", "feature_type": "cve"},
                          worktree_path=Path("/tmp/orca-fix-x"))
         task.fix_plan = self._plan("npm")
-        with patch("subprocess.run") as run:
+        with patch("orchestrator.run_in_group") as run:
             run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
             with patch.object(Path, "exists", return_value=True), \
                  patch.object(Path, "read_text", return_value="# i"):
@@ -459,7 +459,7 @@ class TestAgentEnv(unittest.TestCase):
         task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
                          feature_type="cve", source="go.mod", alert_json=alert,
                          worktree_path=Path("/tmp/orca-fix-x"))
-        with patch("subprocess.run") as run, patch("agent_env.load_config") as cfg:
+        with patch("orchestrator.run_in_group") as run, patch("agent_env.load_config") as cfg:
             cfg.return_value.fix_agent.extra_env = []
             run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
             _invoke_fix_agent(task, dry_run=False, timeout_sec=5)
@@ -584,7 +584,7 @@ class TestInjectionShapeEndToEnd(unittest.TestCase):
                          risk_level="high", feature_type="sast",
                          source="app.py:1", alert_json=alert,
                          worktree_path=Path("/tmp/orca-fix-x"))
-        with patch("subprocess.run") as run:
+        with patch("orchestrator.run_in_group") as run:
             run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
             with patch.object(Path, "exists", return_value=True), \
                  patch.object(Path, "read_text", return_value="# instructions"):
@@ -626,7 +626,7 @@ class TestPromptNeverReachesArgv(unittest.TestCase):
         task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
                          feature_type="sast", source="app.py:1", alert_json=alert,
                          worktree_path=Path("/tmp/orca-fix-x"))
-        with patch("subprocess.run") as run:
+        with patch("orchestrator.run_in_group") as run:
             run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
             with patch.object(Path, "exists", return_value=True), \
                  patch.object(Path, "read_text", return_value="# i"):
@@ -702,7 +702,7 @@ class TestPromptNeverReachesArgv(unittest.TestCase):
                          risk_level="high", feature_type="secret",
                          source="app.py:1", alert_json=alert,
                          worktree_path=Path("/tmp/orca-fix-x"))
-        with patch("subprocess.run") as run:
+        with patch("orchestrator.run_in_group") as run:
             run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
             with patch.object(Path, "exists", return_value=True), \
                  patch.object(Path, "read_text", return_value="# i"):

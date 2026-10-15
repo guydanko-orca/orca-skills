@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from agent_env import (
     neutral_dir,
     push_git,
     run_env,
+    run_in_group,
 )
 from config import load_config
 from impact_agent import ImpactResult, analyze_impact
@@ -261,8 +263,10 @@ def _create_worktree(alert_id: str, branch: str, repo: Repository | None = None)
         subprocess.run([*SAFE_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd,
                        env=git_env())
 
-    _, stderr, rc = _run([*SAFE_GIT, "worktree", "add", "-b", branch, str(path),
-                          BASE_BRANCH], check=False, cwd=cwd, env=git_env())
+    # --no-track: under branch.autoSetupMerge=always, -b records an upstream in
+    # the shared .git/config, which the drift check would read as tampering.
+    _, stderr, rc = _run([*SAFE_GIT, "worktree", "add", "--no-track", "-b", branch,
+                          str(path), BASE_BRANCH], check=False, cwd=cwd, env=git_env())
     if rc != 0:
         msg = stderr.strip() or f"git worktree add failed (exit {rc})"
         if "already used by worktree" in msg or "already exists" in msg:
@@ -358,6 +362,20 @@ def _record_config_baseline(repo: Repository | None) -> str | None:
         return _CONFIG_BASELINES.setdefault(key, snapshot)
 
 
+def _rebaseline(repo: Repository | None) -> None:
+    """Adopt the config as it stands after git the plugin itself ran.
+
+    Only ever called at the end of an exclusive hold that began with a passing
+    check and ran no repository code, so anything that changed in between —
+    git-lfs recording lfs.*.access, say — was written by plugin git.
+    """
+    key = _clone_root(repo)
+    snapshot = _git_config_snapshot(Path(key))
+    if snapshot is not None:
+        with _CONFIG_LOCK:
+            _CONFIG_BASELINES[key] = snapshot
+
+
 def _config_drift(worktree: Path, baseline: str | None) -> str:
     """A failure reason if the config is not provably unchanged, else ""."""
     if baseline is None:
@@ -374,11 +392,69 @@ def _config_drift(worktree: Path, baseline: str | None) -> str:
             "credentials. Inspect the clone's .git/config and included files.")
 
 
+class _CloneGate:
+    """Who may touch one clone, and whether it is still trusted.
+
+    Up to max_parallel_fixes alerts share a clone's .git/config. Repository
+    code (fix agents, build checks) runs holding it shared; a config check and
+    the git that relies on it — the push above all — hold it exclusively, so no
+    agent can rewrite the config between the check and the push. Writers are
+    preferred, or a steady stream of agents would starve the push.
+
+    Once a check finds the config changed the clone is poisoned: no later alert
+    in it runs git at all, its worktrees are deleted without git, and it fails.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+        self.poisoned = ""
+
+    @contextmanager
+    def shared(self):
+        with self._cond:
+            while self._writer or self._writers_waiting:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                self._cond.notify_all()
+
+    @contextmanager
+    def exclusive(self):
+        with self._cond:
+            self._writers_waiting += 1
+            while self._writer or self._readers:
+                self._cond.wait()
+            self._writers_waiting -= 1
+            self._writer = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writer = False
+                self._cond.notify_all()
+
+
+_GATES: dict[str, _CloneGate] = {}
+
+
+def _clone_gate(repo: Repository | None) -> _CloneGate:
+    with _CONFIG_LOCK:
+        return _GATES.setdefault(_clone_root(repo), _CloneGate())
+
+
 def _reset_clone_guards() -> None:
-    """Tests only: forget every baseline and the probed git capabilities."""
+    """Tests only: forget every baseline, gate and probed git capability."""
     with _CONFIG_LOCK:
         _CONFIG_BASELINES.clear()
         _SHOW_SCOPE.clear()
+        _GATES.clear()
 
 
 def _get_diff(worktree_path: Path) -> str:
@@ -614,12 +690,10 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
     ]
 
     try:
-        result = subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True,
-            timeout=timeout_sec,
-            cwd=task.worktree_path,
-            env=agent_env(),
-        )
+        # In its own process group, killed when it exits: its Bash runs
+        # repository code, and nothing that leaves behind may outlive it.
+        result = run_in_group(cmd, input=prompt, timeout=timeout_sec,
+                              cwd=task.worktree_path, env=agent_env())
     except subprocess.TimeoutExpired:
         return FixAgentResult(
             success=False, timed_out=True,
@@ -1003,8 +1077,9 @@ def _push_fix_update(task: AlertTask) -> None:
     # holds the clone exclusively and has just checked its config.
     _run([*SAFE_GIT, "commit", "--no-verify", "-m", commit_msg], cwd=task.worktree_path,
          env=credentialed_env())
-    _run([*push_git(), "push", "--no-verify"], cwd=task.worktree_path,
-         env=credentialed_env())
+    branch = alert_branch_name(task.alert_id)
+    _run([*push_git(), "push", "--no-verify", "origin", f"HEAD:refs/heads/{branch}"],
+         cwd=task.worktree_path, env=credentialed_env())
 
 
 # ---------------------------------------------------------------------------
@@ -1070,21 +1145,53 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
                                "failing closed")
         return task
 
-    try:
-        task.worktree_path = _create_worktree(task.alert_id, branch, repo=repo)
-    except WorktreeConflict as e:
-        task.state = "SKIPPED"
-        task.failure_reason = str(e)
-        return task
-    except RuntimeError as e:
-        task.state = "FAILED"
-        task.failure_reason = f"worktree creation failed: {e}"
-        return task
+    gate = _clone_gate(repo)
+    baseline = _record_config_baseline(repo)
+    with gate.exclusive():
+        reason = gate.poisoned or _config_drift(Path(_clone_root(repo)), baseline)
+        if reason:
+            gate.poisoned = reason
+            task.state = "FAILED"
+            task.failure_reason = reason
+            return task
+        try:
+            task.worktree_path = _create_worktree(task.alert_id, branch, repo=repo)
+        except WorktreeConflict as e:
+            task.state = "SKIPPED"
+            task.failure_reason = str(e)
+            return task
+        except RuntimeError as e:
+            task.state = "FAILED"
+            task.failure_reason = f"worktree creation failed: {e}"
+            return task
+        finally:
+            _rebaseline(repo)
 
     try:
         return _run_pipeline(task, dry_run, notifier, repo)
     finally:
-        _remove_worktree(task.worktree_path, branch, repo=repo)
+        _teardown(task, branch, repo, gate)
+
+
+def _teardown(task: AlertTask, branch: str, repo: Repository, gate: _CloneGate) -> None:
+    """Remove the worktree — with git only if the clone is still trusted."""
+    with gate.exclusive():
+        reason = gate.poisoned or _config_drift(task.worktree_path,
+                                                _record_config_baseline(repo))
+        if not reason:
+            try:
+                _remove_worktree(task.worktree_path, branch, repo=repo)
+            finally:
+                _rebaseline(repo)
+            return
+        gate.poisoned = reason
+        path = task.worktree_path
+        if path and path.exists():
+            try:
+                assert_disposable(path)
+                shutil.rmtree(path, ignore_errors=True)
+            except RuntimeError as e:
+                print(f"[WARN] {task.alert_id} worktree left in place: {e}", flush=True)
 
 
 def _next_candidate_hint(task: AlertTask) -> str:
@@ -1124,20 +1231,30 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     notifier.notify("fix_started", p)
 
     pipeline = get_pipeline(task.feature_type, timeouts=TIMEOUTS)
-    config_baseline = _record_config_baseline(repo)
+    gate = _clone_gate(repo)
 
-    def config_drifted(event: str) -> bool:
-        reason = _config_drift(task.worktree_path, config_baseline)
-        if not reason:
-            return False
-        task.state = "FAILED"
-        task.failure_reason = reason
-        if task.pr_url:
-            _mark_open_pr_failed(task, reason)
-        p = _notify_payload(task)
-        p.repo = repo.name
-        notifier.notify(event, p)
-        return True
+    def checked(event: str, step=None):
+        """Run `step` — git that follows repository code — holding the clone
+        exclusively, once its config is proven unchanged. (ok, step's value)."""
+        with gate.exclusive():
+            reason = gate.poisoned or _config_drift(task.worktree_path,
+                                                    _record_config_baseline(repo))
+            if not reason:
+                if step is None:
+                    return True, None
+                try:
+                    return True, step()
+                finally:
+                    _rebaseline(repo)
+            gate.poisoned = reason
+            task.state = "FAILED"
+            task.failure_reason = reason
+            if task.pr_url:
+                _mark_open_pr_failed(task, reason)
+            p = _notify_payload(task)
+            p.repo = repo.name
+            notifier.notify(event, p)
+            return False, None
 
     # A secret finding whose snippet could not supply the credential is redacted
     # by pattern on every egress path, which can miss one. Known now, so it
@@ -1171,9 +1288,10 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
 
     while task.attempts < MAX_RETRIES:
         task.attempts += 1
-        fix_result = _invoke_fix_agent(task, dry_run, timeout)
+        with gate.shared():
+            fix_result = _invoke_fix_agent(task, dry_run, timeout)
         # Before anything else runs git here, _revert included.
-        if config_drifted("fix_failed"):
+        if not checked("fix_failed")[0]:
             return task
 
         if fix_result.timed_out:
@@ -1191,7 +1309,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
             break
 
         # Retryable: reset and retry
-        _revert(task.worktree_path)
+        if not checked("fix_failed", lambda: _revert(task.worktree_path))[0]:
+            return task
 
     if not fix_result or not fix_result.success:
         task.state = "FAILED"
@@ -1218,10 +1337,14 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     # Phase 1: sanity
     task.state = "VALIDATE_LOCAL"
     print(f"[PHASE] {task.alert_id} sanity check", flush=True)
+    ok, fix_diff = checked("validation_failed", lambda: worktree_diff(task.worktree_path))
+    if not ok:
+        return task
     sanity = sanity_check(task.alert_json, task.worktree_path,
                           feature_type=task.feature_type,
                           diff_limit=pipeline.diff_limit,
-                          diff_summary=fix_result.diff_summary)
+                          diff_summary=fix_result.diff_summary,
+                          diff_text=fix_diff)
     if not sanity.passed:
         task.state = "FAILED"
         task.failure_reason = "; ".join(sanity.failures)
@@ -1232,7 +1355,7 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
 
     # Phase 2: LLM validation
     print(f"[PHASE] {task.alert_id} LLM validation", flush=True)
-    llm_val = llm_validate(task.alert_json, task.worktree_path)
+    llm_val = llm_validate(task.alert_json, task.worktree_path, diff_text=fix_diff)
     if not llm_val.passed:
         task.state = "FAILED"
         task.failure_reason = "; ".join(llm_val.failures)
@@ -1254,7 +1377,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     # local_build_check dispatches on file extension and a manifest bump is .txt,
     # .mod or .json.
     print(f"[PHASE] {task.alert_id} {task.feature_type} verification", flush=True)
-    local_val = pipeline.verify(task, task.worktree_path, plan)
+    with gate.shared():
+        local_val = pipeline.verify(task, task.worktree_path, plan)
     if not local_val.passed:
         task.state = "FAILED"
         task.failure_reason = "; ".join(local_val.failures)
@@ -1266,7 +1390,9 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     # Impact analysis
     task.state = "IMPACT_ANALYSIS"
     print(f"[PHASE] {task.alert_id} production impact analysis", flush=True)
-    diff_text = _get_diff(task.worktree_path)
+    ok, diff_text = checked("validation_failed", lambda: _get_diff(task.worktree_path))
+    if not ok:
+        return task
     task.impact = _with_rotation_step(
         analyze_impact(task.alert_json, diff_text,
                        fix_context=plan.metadata or None),
@@ -1277,11 +1403,12 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
     # Commit + PR
     task.state = "COMMITTING"
     print(f"[PHASE] {task.alert_id} commit + open PR", flush=True)
-    # The build check in pipeline.verify ran repository code too.
-    if config_drifted("validation_failed"):
-        return task
+    # Checked again: other alerts' agents and build checks share this clone.
     try:
-        pr_url = _commit_and_pr(task, task.impact, dry_run)
+        ok, pr_url = checked("validation_failed",
+                             lambda: _commit_and_pr(task, task.impact, dry_run))
+        if not ok:
+            return task
     except RuntimeError as e:
         task.state = "FAILED"
         task.failure_reason = str(e)
@@ -1334,7 +1461,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                     orca_feedback += f"\n\n{alt}"
                 print(f"[RETRY] {task.alert_id} Orca check found issues, "
                       f"retrying fix (attempt {orca_attempt + 2})", flush=True)
-                _revert(task.worktree_path)
+                if not checked("fix_failed", lambda: _revert(task.worktree_path))[0]:
+                    return task
                 # What the PR branch carries until a retry is pushed. A rejected
                 # retry must not end up described in the body of a PR it never
                 # reached.
@@ -1343,9 +1471,10 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                                 "retry was abandoned, so the branch still carries "
                                 "the fix the check failed")
                 timeout = pipeline.timeout_sec
-                fix_result = _invoke_fix_agent(task, dry_run, timeout,
-                                               feedback=orca_feedback)
-                if config_drifted("fix_failed"):
+                with gate.shared():
+                    fix_result = _invoke_fix_agent(task, dry_run, timeout,
+                                                   feedback=orca_feedback)
+                if not checked("fix_failed")[0]:
                     return task
                 if not fix_result.success:
                     task.state = "FAILED"
@@ -1358,10 +1487,15 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                 task.fix_result = fix_result
 
                 # Re-validate locally before pushing
+                ok, retry_diff = checked("validation_failed",
+                                         lambda: worktree_diff(task.worktree_path))
+                if not ok:
+                    return task
                 sanity2 = sanity_check(task.alert_json, task.worktree_path,
                                        feature_type=task.feature_type,
                                        diff_limit=pipeline.diff_limit,
-                                       diff_summary=fix_result.diff_summary)
+                                       diff_summary=fix_result.diff_summary,
+                                       diff_text=retry_diff)
                 if not sanity2.passed:
                     task.state = "FAILED"
                     task.failure_reason = "; ".join(sanity2.failures)
@@ -1372,7 +1506,8 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                     notifier.notify("validation_failed", p)
                     return task
 
-                build2 = pipeline.verify(task, task.worktree_path, plan)
+                with gate.shared():
+                    build2 = pipeline.verify(task, task.worktree_path, plan)
                 if not build2.passed:
                     task.state = "FAILED"
                     task.failure_reason = "; ".join(build2.failures)
@@ -1384,10 +1519,9 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                     return task
 
                 # Push updated fix to same PR branch
-                if config_drifted("validation_failed"):
-                    return task
                 try:
-                    _push_fix_update(task)
+                    if not checked("validation_failed", lambda: _push_fix_update(task))[0]:
+                        return task
                 except RuntimeError as e:
                     task.state = "FAILED"
                     task.failure_reason = f"push fix update failed: {e}"

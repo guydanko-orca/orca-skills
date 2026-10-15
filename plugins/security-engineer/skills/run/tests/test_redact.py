@@ -477,7 +477,7 @@ class TestRedactBeforeTruncate(unittest.TestCase):
             alert_id="orca-abc123", title="t", risk_level="high",
             feature_type="secret", source="app.py:14",
             alert_json=SECRET_ALERT, worktree_path=Path("/tmp/x"))
-        with patch.object(orchestrator.subprocess, "run") as run, \
+        with patch.object(orchestrator, "run_in_group") as run, \
              patch.object(Path, "exists", return_value=True), \
              patch.object(Path, "read_text", return_value="# i"):
             run.return_value.returncode = 1
@@ -706,7 +706,7 @@ class TestFixAgentReasonAtSource(unittest.TestCase):
             alert_id="orca-abc123", title="t", risk_level="high",
             feature_type="secret", source="app.py:14",
             alert_json=SECRET_ALERT, worktree_path=Path("/tmp/x"))
-        with patch.object(orchestrator.subprocess, "run") as run, \
+        with patch.object(orchestrator, "run_in_group") as run, \
              patch.object(Path, "exists", return_value=True), \
              patch.object(Path, "read_text", return_value="# i"):
             run.return_value.returncode = returncode

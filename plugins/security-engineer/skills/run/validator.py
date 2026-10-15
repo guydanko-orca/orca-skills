@@ -20,7 +20,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _json_util import find_last_json_with_key
-from agent_env import SAFE_GIT, agent_env, build_env, credentialed_env, git_env, neutral_dir
+from agent_env import (
+    SAFE_GIT,
+    agent_env,
+    build_env,
+    credentialed_env,
+    git_env,
+    neutral_dir,
+    run_in_group,
+)
 from orca_client import _resolve_feature_type
 from paths import resolve_within
 from redact import SECRET_PATTERNS, build_redactor
@@ -222,7 +230,8 @@ def _claimed_new_versions(summary: str) -> list:
 def sanity_check(alert: dict, worktree_path: Path,
                  feature_type: str | None = None,
                  diff_limit: int | None = None,
-                 diff_summary: str | None = None) -> ValidationResult:
+                 diff_summary: str | None = None,
+                 diff_text: str | None = None) -> ValidationResult:
     """Phase 1 gate: the diff is non-empty, within size limits, and adds no secrets.
 
     feature_type: the *resolved* type ("cve"/"sast"/"iac"/"secret"), which selects
@@ -235,11 +244,14 @@ def sanity_check(alert: dict, worktree_path: Path,
                   back to the _DIFF_LIMITS table when absent.
     diff_summary: the fix agent's own account of what it did. When given, it is
                   checked against the diff — see summary_version_mismatch.
+    diff_text:    the diff, when the caller already took it — the orchestrator
+                  does, holding the clone exclusively after checking its config.
     """
     failures = []
     ft = (feature_type or _resolve_feature_type(alert) or "sast").lower()
 
-    diff_text = worktree_diff(worktree_path)
+    if diff_text is None:
+        diff_text = worktree_diff(worktree_path)
     if not diff_text.strip():
         return ValidationResult(passed=False, phase="sanity",
                                 failures=["git diff is empty — no changes were made"])
@@ -298,11 +310,14 @@ Return ONLY this JSON, with nothing before or after it:
 """
 
 
-def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> ValidationResult:
+def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90,
+                 diff_text: str | None = None) -> ValidationResult:
     redactor = build_redactor(alert)
+    if diff_text is None:
+        diff_text = worktree_diff(worktree_path)
     # Redact before truncating, not after: slicing first can cut a credential in
     # half and leave a fragment no candidate matches.
-    diff_text = bound(redactor(worktree_diff(worktree_path)), 5000)
+    diff_text = bound(redactor(diff_text), 5000)
 
     # Both halves are repository content: alert_json carries code_snippet, and a
     # diff is the file it came from. A verdict is worth steering — "pass" here is
@@ -498,8 +513,7 @@ def _find_go_module_root(files: list[str], worktree_path: Path) -> Path:
 
 def _run_check(cmd: list[str], cwd: Path, redactor=None) -> ValidationResult:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=cwd,
-                                env=build_env())
+        result = run_in_group(cmd, timeout=120, cwd=cwd, env=build_env())
     except subprocess.TimeoutExpired:
         return ValidationResult(passed=False, phase="local_build",
                                 failures=[f"local build timed out ({' '.join(cmd)})"])
@@ -519,10 +533,8 @@ def _check_python(files: list[str], cwd: Path, redactor=None) -> ValidationResul
             continue
         # -I: `-m` otherwise searches the current directory first, which is the
         # cloned tree in single-repo mode, so a committed py_compile.py would run.
-        result = subprocess.run(
-            ["python3", "-I", "-m", "py_compile", str(cwd / f)],
-            capture_output=True, text=True, timeout=15, env=build_env(),
-        )
+        result = run_in_group(["python3", "-I", "-m", "py_compile", str(cwd / f)],
+                              timeout=15, env=build_env())
         if result.returncode != 0:
             detail = (redactor or build_redactor(None))(result.stderr)[:150]
             failures.append(f"syntax error in {f}: {detail}")
