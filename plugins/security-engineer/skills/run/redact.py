@@ -44,7 +44,8 @@ arrives masked (`sk-****`), empty, or with no literal a value can be read from,
 every candidate is a string that appears nowhere and the redactor matches
 nothing — silently. For a secret finding that is the case to fail safe on: the
 redactor falls back to the sanity gate's own SECRET_PATTERNS plus a
-high-entropy-token heuristic over everything it scrubs, and says so through
+random-token heuristic (per-alphabet entropy floors, names and paths excluded)
+over everything it scrubs, and says so through
 `fallback_reason`, which the orchestrator turns into a needs-review reason. A
 pattern can miss a credential of an unfamiliar shape, which is why it is flagged
 rather than trusted.
@@ -96,7 +97,19 @@ _MASKED = re.compile(r"\*{3,}|•{3,}|(?i:x{6,})|(?i:redacted|masked)")
 # than 20 it starts matching words; a fence tag (`/untrusted-` plus an 8-hex
 # nonce) is 19, so it can never be taken for one.
 _TOKEN = re.compile(r"[A-Za-z0-9+/=_\-]{20,}")
-_MIN_TOKEN_ENTROPY = 3.8   # bits per character; identifiers and words sit well below
+
+# A token is judged by its separator-free parts, so `fix/orca-12345678-abcdef`
+# is four short words, not one 24-character key, while the random tail of
+# `sk-live-<random>` is still judged on its own.
+_PART_SEP = re.compile(r"[/._\-@]")
+_MIN_PART = 16
+# Floors are per alphabet, because the ceiling is: hex cannot exceed 4 bits per
+# character, and a random 20-character string cannot exceed log2(20) ≈ 4.3
+# whatever its alphabet. A single floor that suits base64 misses most hex keys.
+_HEX_MIN_ENTROPY = 3.0
+_MIXED_ENTROPY_MARGIN = 0.9  # below log2(length)
+_DIGEST_LENGTHS = (40, 64)   # git SHA-1 / SHA-256 and the digests shaped like them
+_SRI = re.compile(r"sha(?:1|256|384|512)-")
 
 FALLBACK_REASON = (
     "Orca's code_snippet for this secret finding did not contain a usable "
@@ -154,21 +167,51 @@ def _entropy(token: str) -> float:
     return -sum(n / len(token) * math.log2(n / len(token)) for n in counts.values())
 
 
-def _looks_random(token: str) -> bool:
-    return (any(c.isdigit() for c in token) and any(c.isalpha() for c in token)
-            and _entropy(token) >= _MIN_TOKEN_ENTROPY)
+def _part_looks_random(part: str) -> bool:
+    if len(part) < _MIN_PART:
+        return False
+    if re.fullmatch(r"[0-9a-fA-F]+", part):
+        if len(part) in _DIGEST_LENGTHS:
+            return False
+        return (bool(re.search(r"[0-9]", part)) and bool(re.search(r"[a-fA-F]", part))
+                and _entropy(part) >= _HEX_MIN_ENTROPY)
+    classes = sum(bool(re.search(c, part)) for c in (r"[a-z]", r"[A-Z]", r"[0-9]"))
+    if classes < 2:
+        return False
+    # camelCase and PascalCase names are mostly runs of lowercase letters; a
+    # random string over 62+ symbols almost never is.
+    if sum(len(run) for run in re.findall(r"[a-z]{3,}", part)) >= len(part) / 2:
+        return False
+    return _entropy(part) >= math.log2(len(part)) - _MIXED_ENTROPY_MARGIN
 
 
-def _scrub_patterns(text: str) -> str:
-    """Redact by shape: SECRET_PATTERNS' value groups, then random-looking tokens."""
+def _looks_random(token: str, keep: frozenset = frozenset()) -> bool:
+    if _SRI.match(token):
+        return False
+    return any(_part_looks_random(part) for part in _PART_SEP.split(token)
+               if part not in keep)
+
+
+def _scrub_patterns(text: str, keep: frozenset = frozenset()) -> str:
+    """Redact by shape: SECRET_PATTERNS' value groups, then random-looking tokens.
+
+    keep: path parts never to treat as keys — the alert's own file path, which
+          gate 2 and the PR body have to name, however it is prefixed.
+    """
     def value_only(m):
         start, end = m.span("value")
         return m.string[m.start():start] + PLACEHOLDER + m.string[end:m.end()]
 
     for pattern in _COMPILED_PATTERNS:
         text = pattern.sub(value_only, text)
-    return _TOKEN.sub(lambda m: PLACEHOLDER if _looks_random(m.group()) else m.group(),
+    return _TOKEN.sub(lambda m: PLACEHOLDER if _looks_random(m.group(), keep) else m.group(),
                       text)
+
+
+def _path_tokens(alert: dict) -> frozenset:
+    paths = " ".join(str(alert.get(k) or "") for k in ("file_path", "source"))
+    return frozenset(part for token in _TOKEN.findall(paths)
+                     for part in _PART_SEP.split(token))
 
 
 class Redactor:
@@ -180,11 +223,12 @@ class Redactor:
     """
 
     def __init__(self, candidates: list[str] | None = None,
-                 fallback_reason: str | None = None):
+                 fallback_reason: str | None = None, keep: frozenset = frozenset()):
         self.candidates = candidates or []
         # Set when the alert could not supply the credential itself. Pattern
         # redaction then runs on everything, and the reason is what the PR says.
         self.fallback_reason = fallback_reason
+        self.keep = keep
 
     def __bool__(self) -> bool:
         return bool(self.candidates or self.fallback_reason)
@@ -197,7 +241,7 @@ class Redactor:
             if candidate in text:
                 text = text.replace(candidate, PLACEHOLDER)
         if self.fallback_reason:
-            text = _scrub_patterns(text)
+            text = _scrub_patterns(text, self.keep)
         return text
 
     def scrub(self, value):
@@ -236,4 +280,4 @@ def build_redactor(alert: dict | None) -> Redactor:
     candidates, has_value = _candidates(alert)
     if has_value and not _looks_masked(alert):
         return Redactor(candidates)
-    return Redactor(candidates, fallback_reason=FALLBACK_REASON)
+    return Redactor(candidates, fallback_reason=FALLBACK_REASON, keep=_path_tokens(alert))

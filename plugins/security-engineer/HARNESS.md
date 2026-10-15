@@ -436,9 +436,14 @@ so the redactor is built to be safe either way. A masked string (`sk-****`,
 `[REDACTED]`) is never a candidate, since it matches nothing real. If the
 snippet looks masked or yields no value at all, a secret finding's redactor
 falls back to redacting by shape on every egress path: the sanity gate's own
-`SECRET_PATTERNS` (one list, shared, value group only so keys survive) plus any
-20+ character token with letters, digits and at least 3.8 bits of entropy per
-character. Shapes can miss a credential, so the alert is also flagged
+`SECRET_PATTERNS` (one list, shared, value group only so keys survive) plus a
+random-token check. That check judges each separator-free part of a 20+
+character token (16+ characters) against a floor for its alphabet — hex cannot
+exceed 4 bits per character, so one floor for all would miss most hex keys — and
+skips git-digest-shaped hex, `sha512-` integrity strings, camelCase names and the
+alert's own file path. Measured on 1000 random strings each: 97% of 20-hex,
+100% of 32-hex, 82% of 20-character and 96% of 32-character base64 caught; none
+of the path, name and digest examples in `test_redact.py` flagged. Shapes can miss a credential, so the alert is also flagged
 `needs-review` with that reason in the PR body, before the fix agent runs.
 
 ## Degradation policy

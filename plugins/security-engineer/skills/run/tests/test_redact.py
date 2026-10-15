@@ -265,6 +265,65 @@ class TestMaskedSnippetFallsBackToPatterns(unittest.TestCase):
         self.assertIn("masked", captured["body"])
 
 
+class TestEntropyHeuristicRates(unittest.TestCase):
+    """The fallback's random-token check, measured rather than asserted on one
+    example. A single bits-per-character floor was backwards: hex tops out at 4
+    bits, so 3.8 missed most random hex keys while path-like tokens such as
+    `fix/orca-12345678-abcdef` cleared it and were blanked from gate 2."""
+
+    @staticmethod
+    def _rate(alphabet, length, n=1000):
+        import random
+
+        from redact import _looks_random
+        rng = random.Random(7)
+        return sum(_looks_random("".join(rng.choice(alphabet) for _ in range(length)))
+                   for _ in range(n)) / n
+
+    def test_random_keys_are_caught(self):
+        import string
+        hexdigits = "0123456789abcdef"
+        b64 = string.ascii_letters + string.digits + "+/"
+        alnum = string.ascii_letters + string.digits
+        for desc, alphabet, length, floor in (
+                ("hex 20", hexdigits, 20, 0.95), ("hex 32", hexdigits, 32, 0.99),
+                ("base64 32", b64, 32, 0.93), ("base64 40", b64, 40, 0.97),
+                ("alnum 20", alnum, 20, 0.95), ("alnum 40", alnum, 40, 0.97),
+                ("base64 20", b64, 20, 0.75)):
+            with self.subTest(desc):
+                self.assertGreaterEqual(self._rate(alphabet, length), floor, desc)
+
+    BENIGN = ["fix/orca-12345678-abcdef", "src/config/credentials_v2",
+              "package-lock-v3-entry", "123e4567-e89b-12d3-a456-426614174000",
+              "0123456789abcdef0123456789abcdef01234567",          # git SHA-1
+              "0123456789abcdef" * 4,                             # SHA-256
+              "test_redact_fallback_secret_2", "HttpClientConnectionPool2",
+              "ValidationResultV2Factory", "AbstractSingletonProxyFactoryBean2",
+              "getUserById2FromCache", "MAX_RETRY_COUNT_V2_ENABLED",
+              "node_modules/@babel/core-7.22.1"]
+
+    def test_names_paths_and_digests_are_not_taken_for_keys(self):
+        from redact import _looks_random
+        for token in self.BENIGN:
+            with self.subTest(token):
+                self.assertFalse(_looks_random(token), token)
+
+    def test_subresource_integrity_is_not_a_key(self):
+        from redact import _looks_random
+        digest = base64.b64encode(hashlib.sha512(b"lockfile").digest()).decode()
+        self.assertFalse(_looks_random(f"sha512-{digest}"))
+
+    def test_the_alerts_own_file_path_survives(self):
+        """A random-looking path component is still the file gate 2 must see."""
+        name = base64.b64encode(hashlib.sha256(b"asset-name").digest()).decode()[:22]
+        name = name.replace("/", "x").replace("+", "y")
+        path = f"assets/{name}.json"
+        alert = dict(SECRET_ALERT, code_snippet=[], file_path=path, source=f"{path}:3")
+        self.assertIn(path, build_redactor(alert)(f"+++ b/{path}"))
+        self.assertNotIn(name, build_redactor(dict(SECRET_ALERT, code_snippet=[]))(
+            f"+++ b/{path}"), "without the alert naming it, it does look random")
+
+
 class TestRedactor(unittest.TestCase):
     def setUp(self):
         self.r = build_redactor(SECRET_ALERT)
