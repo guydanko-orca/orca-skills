@@ -308,8 +308,6 @@ class TestEntropyHeuristicRates(unittest.TestCase):
 
     BENIGN = ["fix/orca-12345678-abcdef", "src/config/credentials_v2",
               "package-lock-v3-entry", "123e4567-e89b-12d3-a456-426614174000",
-              "0123456789abcdef0123456789abcdef01234567",          # git SHA-1
-              "0123456789abcdef" * 4,                             # SHA-256
               "test_redact_fallback_secret_2", "HttpClientConnectionPool2",
               "ValidationResultV2Factory", "AbstractSingletonProxyFactoryBean2",
               "getUserById2FromCache", "MAX_RETRY_COUNT_V2_ENABLED",
@@ -320,6 +318,68 @@ class TestEntropyHeuristicRates(unittest.TestCase):
         for token in self.BENIGN:
             with self.subTest(token):
                 self.assertFalse(_looks_random(token), token)
+
+    @staticmethod
+    def _hex(rng, length):
+        return "".join(rng.choice("0123456789abcdef") for _ in range(length))
+
+    def _scrub_rate(self, template, length, n=500):
+        import random
+        rng = random.Random(3)
+        r = build_redactor(dict(SECRET_ALERT, code_snippet=[]))
+        hits = 0
+        for _ in range(n):
+            value = self._hex(rng, length)
+            hits += value not in r(template.format(value))
+        return hits / n
+
+    def test_unquoted_key_assignment_is_caught_at_any_length(self):
+        """`-KEY=<hex>` went from always caught to never after the part split,
+        because `=` did not separate the name from the value."""
+        for length in (8, 12, 16, 20, 32, 40, 64):
+            for template in ("-KEY={}", "+DEPLOY_TOKEN={}", "-  api_secret: {}"):
+                with self.subTest(template=template, length=length):
+                    self.assertEqual(self._scrub_rate(template, length), 1.0)
+
+    def test_bare_digest_length_hex_is_caught_without_git_context(self):
+        """40 and 64 hex characters are a SHA only when something says so."""
+        for length in (40, 64):
+            for template in ("rotate {} now", "-{}", 'creds = ["{}"]'):
+                with self.subTest(template=template, length=length):
+                    self.assertGreaterEqual(self._scrub_rate(template, length), 0.99)
+
+    def test_git_and_lockfile_digests_survive(self):
+        import random
+        rng = random.Random(5)
+        r = build_redactor(dict(SECRET_ALERT, code_snippet=[]))
+        sha, sha2, sha256 = self._hex(rng, 40), self._hex(rng, 40), self._hex(rng, 64)
+        for line in (f"index {sha}..{sha2} 100644", f"commit {sha}",
+                     f"Merge: {sha} {sha2}", f"github.com/o/r@{sha}",
+                     f'"resolved": "git+https://github.com/o/r.git#{sha}"',
+                     f"  revision: {sha}", f'checksum = "{sha256}"',
+                     f"  sha: {sha}", f"tree {sha}", f"parent {sha}"):
+            with self.subTest(line=line[:16]):
+                self.assertEqual(r(line), line)
+
+    def test_scrubbing_hostile_lines_takes_linear_time(self):
+        """Diff context is attacker-written and is scrubbed before any bound. The
+        first unquoted-assignment pattern took minutes on `key-` * 5000."""
+        import time
+        r = build_redactor(dict(SECRET_ALERT, code_snippet=[]))
+        for text in ("key-" * 5000, "a-" * 10000 + "key", "token='" * 3000,
+                     "KEY=" * 5000, "ab1-" * 5000 + "=x", "x" * 20000):
+            with self.subTest(text=text[:8]):
+                started = time.monotonic()
+                r(text)
+                self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_a_code_reference_on_the_right_is_not_a_value(self):
+        """Redacting the fix line would blind gate 2 to the fix."""
+        r = build_redactor(dict(SECRET_ALERT, code_snippet=[]))
+        for line in ('+API_KEY = os.environ["API_KEY"]', "+KEY=process.env.KEY",
+                     "+token = getToken()", "+SECRET=${SECRET}"):
+            with self.subTest(line):
+                self.assertEqual(r(line), line)
 
     def test_subresource_integrity_is_not_a_key(self):
         from redact import _looks_random

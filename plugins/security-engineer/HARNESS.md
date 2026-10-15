@@ -439,13 +439,20 @@ snippet looks masked, or yields no value shaped like a credential — one a
 secret pattern captures or that looks random — a secret finding's redactor
 falls back to redacting by shape on every egress path: the sanity gate's own
 `SECRET_PATTERNS` (one list, shared, value group only so keys survive) plus a
-random-token check. That check judges each separator-free part of a 20+
-character token (16+ characters) against a floor for its alphabet — hex cannot
-exceed 4 bits per character, so one floor for all would miss most hex keys — and
-skips git-digest-shaped hex, `sha512-` integrity strings, camelCase names and the
-alert's own file path. Measured on 1000 random strings each: 97% of 20-hex,
-100% of 32-hex, 82% of 20-character and 96% of 32-character base64 caught; none
-of the path, name and digest examples in `test_redact.py` flagged. Shapes can miss a credential, so the alert is also flagged
+unquoted value assigned to a credential-named key (`KEY=<value>`, any length
+from 8, unless the right side is code such as `os.environ[...]`), plus a
+random-token check. That check judges each separator-free part (`/ . _ - @ =`)
+of a 20+ character token (16+ characters) against a floor for its alphabet — hex
+cannot exceed 4 bits per character, so one floor for all would miss most hex
+keys. It skips `sha512-` integrity strings, camelCase names and the alert's own
+file path, and skips 40- and 64-hex only where the line marks it as a git SHA or
+checksum (`index`, `commit`, `@`, `#`, `revision`, `checksum`, `resolved`, …);
+anywhere else such a value is treated as a key. Measured on 500 random hex
+values each: `-KEY=<hex>` 100% at every length from 8 to 64; bare hex in prose
+97% at 20, 100% at 32, 40 and 64, but 0% below 20 characters. On 1000 random
+strings, 82% of 20-character and ~95% of 32-character base64 caught. Paths,
+names and SHAs in diff headers and lockfiles are left alone. Over-redaction is
+the accepted failure here; under-redaction is not. Shapes can miss a credential, so the alert is also flagged
 `needs-review` with that reason in the PR body, before the fix agent runs.
 
 ## Degradation policy

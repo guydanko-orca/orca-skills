@@ -107,15 +107,36 @@ _TOKEN = re.compile(r"[A-Za-z0-9+/=_\-]{20,}")
 
 # A token is judged by its separator-free parts, so `fix/orca-12345678-abcdef`
 # is four short words, not one 24-character key, while the random tail of
-# `sk-live-<random>` is still judged on its own.
-_PART_SEP = re.compile(r"[/._\-@]")
+# `sk-live-<random>` and the value in `KEY=<hex>` are still judged on their own.
+_PART_SEP = re.compile(r"[/._\-@=]")
 _MIN_PART = 16
 # Floors are per alphabet, because the ceiling is: hex cannot exceed 4 bits per
 # character, and a random 20-character string cannot exceed log2(20) ≈ 4.3
 # whatever its alphabet. A single floor that suits base64 misses most hex keys.
 _HEX_MIN_ENTROPY = 3.0
 _MIXED_ENTROPY_MARGIN = 0.9  # below log2(length)
-_DIGEST_LENGTHS = (40, 64)   # git SHA-1 / SHA-256 and the digests shaped like them
+# 40 and 64 hex characters are a git SHA-1/SHA-256 or a lockfile checksum only
+# when the line says so; otherwise they are as likely a key and are treated as one.
+_DIGEST_LENGTHS = (40, 64)
+_DIGEST_CONTEXT = re.compile(
+    r"(?i)(?:^|[^\w])(?:index|commit|merge|tree|parent|object|sha\d*|rev|revision"
+    r"|checksum|integrity|resolved|hash|digest)\b[^\n]*$")
+
+# Fallback only: an unquoted value assigned to a credential-named key, such as
+# `KEY=<hex>` in a .env file, at any length — entropy cannot judge a short one.
+# Not shared with the sanity gate, which would then reject `KEY=$KEY`-style
+# fixes. The value must end at a delimiter, so `os.environ["KEY"]`,
+# `process.env.KEY` and `getKey()` on the right are code, not values.
+#
+# The key is any one name, bounded and anchored at its start, and is checked for
+# a credential word afterwards in Python. Expressing that word inside the regex
+# put two unbounded runs around an alternation, and a long hyphenated line took
+# minutes to scan — attacker-written diff context, before any bound.
+_UNQUOTED_ASSIGNMENT = re.compile(
+    r"(?<![\w-])(?P<key>[\w-]{1,64})[ \t]*[=:][ \t]*"
+    r"(?P<value>[^\s\"'#,;()\[\]{}$.]{8,})(?=[\s\"'#,;]|$)",
+    re.MULTILINE)
+_CREDENTIAL_NAME = re.compile(r"(?i)key|secret|token|passw(?:or)?d|pwd|auth|credential")
 _SRI = re.compile(r"sha(?:1|256|384|512)-")
 
 FALLBACK_REASON = (
@@ -187,11 +208,11 @@ def _entropy(token: str) -> float:
     return -sum(n / len(token) * math.log2(n / len(token)) for n in counts.values())
 
 
-def _part_looks_random(part: str) -> bool:
+def _part_looks_random(part: str, digest_context: bool = False) -> bool:
     if len(part) < _MIN_PART:
         return False
     if re.fullmatch(r"[0-9a-fA-F]+", part):
-        if len(part) in _DIGEST_LENGTHS:
+        if digest_context and len(part) in _DIGEST_LENGTHS:
             return False
         return (bool(re.search(r"[0-9]", part)) and bool(re.search(r"[a-fA-F]", part))
                 and _entropy(part) >= _HEX_MIN_ENTROPY)
@@ -205,11 +226,18 @@ def _part_looks_random(part: str) -> bool:
     return _entropy(part) >= math.log2(len(part)) - _MIXED_ENTROPY_MARGIN
 
 
-def _looks_random(token: str, keep: frozenset = frozenset()) -> bool:
+def _looks_random(token: str, keep: frozenset = frozenset(),
+                  digest_context: bool = False) -> bool:
     if _SRI.match(token):
         return False
-    return any(_part_looks_random(part) for part in _PART_SEP.split(token)
+    return any(_part_looks_random(part, digest_context) for part in _PART_SEP.split(token)
                if part not in keep)
+
+
+def _in_digest_context(m) -> bool:
+    """Does the line say the token at m is a SHA or a checksum?"""
+    before = m.string[max(0, m.string.rfind("\n", 0, m.start()) + 1):m.start()]
+    return before.endswith(("@", "#")) or bool(_DIGEST_CONTEXT.search(before))
 
 
 def _scrub_patterns(text: str, keep: frozenset = frozenset()) -> str:
@@ -224,8 +252,12 @@ def _scrub_patterns(text: str, keep: frozenset = frozenset()) -> str:
 
     for pattern in _COMPILED_PATTERNS:
         text = pattern.sub(value_only, text)
-    return _TOKEN.sub(lambda m: PLACEHOLDER if _looks_random(m.group(), keep) else m.group(),
-                      text)
+    text = _UNQUOTED_ASSIGNMENT.sub(
+        lambda m: value_only(m) if _CREDENTIAL_NAME.search(m.group("key")) else m.group(),
+        text)
+    return _TOKEN.sub(lambda m: PLACEHOLDER
+                      if _looks_random(m.group(), keep, _in_digest_context(m))
+                      else m.group(), text)
 
 
 def _path_tokens(alert: dict) -> frozenset:
