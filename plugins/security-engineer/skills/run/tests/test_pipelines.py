@@ -47,6 +47,9 @@ except ImportError:
 requires_yaml = unittest.skipIf(
     _yaml is None, "config parsing needs PyYAML (pip install pyyaml)")
 
+# Directives are rendered per fix-agent invocation, with that invocation's nonce.
+_NONCE = "testnonce"
+
 _REQUIREMENTS = ("numpy==1.21.0\n"
                  "pillow==8.3.1\n"
                  "flask==1.0.2\n")
@@ -196,7 +199,7 @@ class TestGenericPipelineIsUnchanged(unittest.TestCase):
         for desc, ft in self.TYPES:
             with self.subTest(desc):
                 plan = get_pipeline(ft).prepare(_task(ft), Path("/tmp/nope"))
-                self.assertEqual(plan.prompt_extra, "", desc)
+                self.assertEqual(plan.directive(_NONCE), "", desc)
                 self.assertEqual(plan.metadata, {}, desc)
                 self.assertIsNone(plan.error, desc)
                 self.assertFalse(plan.needs_review, desc)
@@ -250,14 +253,14 @@ class TestCvePrepare(_TreeCase):
         plan = self._prepare()
         self.assertIsNone(plan.error)
         self.assertTrue(plan.prepared)
-        self.assertIn("10.0.1", plan.prompt_extra)
-        self.assertIn("pillow", plan.prompt_extra)
-        self.assertIn("./python-ml/requirements.txt", plan.prompt_extra)
+        self.assertIn("10.0.1", plan.directive(_NONCE))
+        self.assertIn("pillow", plan.directive(_NONCE))
+        self.assertIn("./python-ml/requirements.txt", plan.directive(_NONCE))
 
     def test_directive_forbids_substitution(self):
         """The freelancing this replaces is what produced three rationales."""
         plan = self._prepare()
-        lowered = plan.prompt_extra.lower()
+        lowered = plan.directive(_NONCE).lower()
         self.assertIn("do not", lowered)
         self.assertIn("already decided", lowered)
         self.assertIn("report failure", lowered)
@@ -284,19 +287,19 @@ class TestCvePrepare(_TreeCase):
     def test_multi_major_jump_is_spelled_out(self):
         plan = self._prepare(fetcher=_pillow_fetcher(
             fixed="12.3.0", versions=["8.3.1", "12.3.0"]))
-        self.assertIn("4 major versions", plan.prompt_extra)
+        self.assertIn("4 major versions", plan.directive(_NONCE))
         self.assertEqual(plan.metadata["version_decision"]["majors_crossed"], 4)
 
     def test_alternatives_are_offered_only_as_a_fallback(self):
         plan = self._prepare(fetcher=_pillow_fetcher(
             fixed="9.0.0", versions=["8.3.1", "9.0.0", "9.1.0"]))
-        self.assertIn("9.1.0", plan.prompt_extra)
-        self.assertIn("if and only if", plan.prompt_extra)
+        self.assertIn("9.1.0", plan.directive(_NONCE))
+        self.assertIn("if and only if", plan.directive(_NONCE))
 
     def test_sole_candidate_offers_no_alternatives(self):
         plan = self._prepare(fetcher=_pillow_fetcher(
             fixed="12.3.0", versions=["8.3.1", "12.3.0"]))
-        self.assertNotIn("Safe alternatives", plan.prompt_extra)
+        self.assertNotIn("safe_alternatives", plan.directive(_NONCE))
 
     # (description, fetcher, expect_needs_review)
     REVIEW_CASES = [
@@ -358,14 +361,14 @@ class TestCvePrepare(_TreeCase):
                 plan = self._prepare(alert={**_PILLOW_ALERT, **overrides})
                 self.assertIn(fragment, plan.error or "", desc)
                 self.assertTrue(plan.needs_review, desc)
-                self.assertEqual(plan.prompt_extra, "", desc)
+                self.assertEqual(plan.directive(_NONCE), "", desc)
 
     def test_data_layer_outage_degrades(self):
         plan = self._prepare(fetcher=FakeFetcher(raises=RuntimeError("HTTP 503")))
         self.assertIn("version resolution failed", plan.error)
         self.assertIn("HTTP 503", plan.error)
         self.assertTrue(plan.needs_review)
-        self.assertEqual(plan.prompt_extra, "")
+        self.assertEqual(plan.directive(_NONCE), "")
 
     def test_no_safe_version_degrades(self):
         fetcher = FakeFetcher(
@@ -651,19 +654,21 @@ class TestRequestedCveReachesTheAgent(_TreeCase):
 
     def test_directive_names_the_advisory(self):
         plan = self._prepare(["CVE-2023-4863"])
-        self.assertIn("CVE-2023-4863", plan.prompt_extra)
-        self.assertIn("do not narrow the bump", plan.prompt_extra)
+        self.assertIn("CVE-2023-4863", plan.directive(_NONCE))
+        self.assertIn("do not narrow the bump", plan.directive(_NONCE))
 
     def test_directive_unchanged_without_a_request(self):
         """No advisory named means the prompt the agent has always seen."""
         plan = self._prepare([])
         self.assertEqual(plan.metadata["requested_cves"], [])
-        self.assertNotIn("This alert was selected because", plan.prompt_extra)
+        self.assertNotIn("This alert was selected because", plan.directive(_NONCE))
 
     def test_target_version_still_stated(self):
         """The requested-CVE line must not displace the actual instruction."""
         plan = self._prepare(["CVE-2023-4863"])
-        self.assertIn("Set **pillow** to exactly **10.0.1**", plan.prompt_extra)
+        text = plan.directive(_NONCE)
+        self.assertIn("exactly the `target_version`", text)
+        self.assertIn("target_version: 10.0.1", text)
 
 
 # ---------------------------------------------------------------------------
@@ -701,7 +706,7 @@ class TestOrchestratorUsesThePipeline(unittest.TestCase):
     def test_directive_reaches_the_fix_prompt(self):
         """A plan nobody puts in the prompt is a plan the agent cannot follow."""
         task = _task("cve")
-        task.fix_plan = FixPlan(prompt_extra="SET pillow TO 10.0.1")
+        task.fix_plan = FixPlan(render_directive=lambda nonce: "SET pillow TO 10.0.1")
         with patch("orchestrator.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
@@ -820,8 +825,8 @@ class TestEcosystemFragments(unittest.TestCase):
             pipeline = CvePipeline(fetcher=_pillow_fetcher(),
                                    allow_llm_identify=False)
             plan = pipeline.prepare(_task("cve"), root)
-        self.assertIn("Python (PyPI)", plan.prompt_extra)
-        self.assertIn("requirements.txt", plan.prompt_extra)
+        self.assertIn("Python (PyPI)", plan.directive(_NONCE))
+        self.assertIn("requirements.txt", plan.directive(_NONCE))
 
 
 # ---------------------------------------------------------------------------

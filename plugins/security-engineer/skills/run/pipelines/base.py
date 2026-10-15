@@ -15,6 +15,7 @@ adds two hooks around the fix agent:
 
 Specializing a type means adding a pipeline, not editing the orchestrator.
 """
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,19 +26,29 @@ from validator import ValidationResult, local_build_check
 class FixPlan:
     """What a specialist worked out before the fix agent was invoked.
 
-    prompt_extra is appended to the fix prompt, so a pipeline can turn "figure
-    out what to do" into "do this". metadata travels on to impact analysis and
-    the PR body, which is how a decision made here becomes reviewable later.
+    render_directive is appended to the fix prompt, so a pipeline can turn
+    "figure out what to do" into "do this". It is a function of the prompt's
+    nonce rather than a finished string because what it states — a package
+    name, a manifest path, a version — comes from the repository and the
+    advisory feeds, so those values have to be fenced with the nonce of the
+    prompt they land in, which does not exist until the agent is invoked.
+    metadata travels on to impact analysis and the PR body, which is how a
+    decision made here becomes reviewable later.
     """
     summary: str = ""
-    prompt_extra: str = ""
+    render_directive: Callable[[str], str] | None = field(default=None, repr=False,
+                                                         compare=False)
     metadata: dict = field(default_factory=dict)
     needs_review: bool = False
     error: str | None = None
 
+    def directive(self, nonce: str) -> str:
+        """The directive for one fix prompt, or "" when there is none."""
+        return self.render_directive(nonce) if self.render_directive else ""
+
     @property
     def prepared(self) -> bool:
-        return self.error is None and bool(self.prompt_extra or self.metadata)
+        return self.error is None and bool(self.render_directive or self.metadata)
 
 
 class FixPipeline:

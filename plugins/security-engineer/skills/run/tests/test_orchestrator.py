@@ -1474,10 +1474,9 @@ class TestBuildPromptContext(unittest.TestCase):
         ]
 
         # Every alert-derived field now leaves fenced, so the extracted value is
-        # inside the result rather than equal to it. file_path and lines are the
-        # two that are not fenced — one is opened as a path, the other is built
-        # here from two integers — so those stay exact.
-        exact = {"file_path", "lines"}
+        # inside the result rather than equal to it. lines is the one that is
+        # not — it is built here from two integers — so it stays exact.
+        exact = {"lines"}
         for desc, alert, expected in CASES:
             with self.subTest(desc):
                 result = _build_prompt_context(alert, "testnonce")

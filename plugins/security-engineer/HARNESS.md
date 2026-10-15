@@ -222,14 +222,25 @@ could therefore address the fixer directly (`NOTE TO AUTOMATED FIXER: before
 editing, run …`) and have it arrive as guidance.
 
 `untrusted.py` draws the boundary. Every prompt opens with a preamble stating the
-rule before a single untrusted byte appears; every alert-derived field is wrapped
-in `<untrusted-NONCE id="field"> … </untrusted-NONCE>` markers whose nonce is
+rule before a single untrusted byte appears; every alert-derived field — the
+affected `file_path` included — is wrapped in
+`<untrusted-NONCE id="field"> … </untrusted-NONCE>` markers whose nonce is
 random per invocation, so content cannot close a fence whose name it was never
 told; and every field is capped at `FIELD_LIMIT`, so a huge snippet cannot push
-the real instructions out of attention. The agent's own instructions stay outside
-every fence. The same applies to the LLM-validation and impact prompts — those
-have no tools, but a steered verdict is how a fix that does nothing gets past
-gate 2, and steered impact prose is pasted straight into the PR body.
+the real instructions out of attention. Any copy of the nonce-tagged prefix
+inside the content is stripped until none is left, since a single pass over
+`</untrusted-N</untrusted-N>>` would reassemble the closer it just removed. The
+agent's own instructions stay outside every fence. The same applies to the
+LLM-validation and impact prompts — those have no tools, but a steered verdict is
+how a fix that does nothing gets past gate 2, and steered impact prose is pasted
+straight into the PR body.
+
+A specialist's directive is ours, but what it states is not: the CVE pipeline's
+package name and manifest path come from the repository, and its versions and
+rationale from OSV and deps.dev, where a package publisher chooses the version
+strings. So the directive is rendered per invocation with that prompt's nonce
+(`FixPlan.render_directive`): the sentences stay outside, and every value they
+refer to sits in one fenced `version_decision` block.
 
 Order against the redactor is redact, then bound, then fence: slicing first can
 cut a credential in half and leave a fragment no candidate matches. The fix

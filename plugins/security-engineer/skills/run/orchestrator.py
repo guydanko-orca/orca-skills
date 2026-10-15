@@ -355,7 +355,7 @@ You are reviewing what a fix would look like for this vulnerability.
 {instructions}
 
 Describe the planned fix:
-1. Read the file at {file_path}.
+1. Read the file named in the Location section above.
 2. Show before/after of what the fix would look like.
 3. Explain why this addresses the vulnerability.
 
@@ -363,12 +363,12 @@ Describe the planned fix:
 {alert_json}
 
 Print ONLY this JSON as your very last output:
-{{"status": "success", "alert_id": "{alert_id}", "files_changed": ["{file_path}"], "diff_summary": "<planned change>", "manual_steps": []}}
+{{"status": "success", "alert_id": "{alert_id}", "files_changed": ["path/to/file"], "diff_summary": "<planned change>", "manual_steps": []}}
 """
 
 
-# A path is used as a path — "Read the file at {file_path}" — so fencing it would
-# break the sentence it sits in. Bounding it is what stops it being a paragraph.
+# A path longer than this is not a path. Bounded before it is fenced, like
+# every other field, so it cannot become a paragraph either.
 _PATH_LIMIT = 512
 
 
@@ -376,10 +376,10 @@ def _build_prompt_context(alert: dict, nonce: str) -> dict:
     """Extract structured fields from alert JSON for fix agent prompts.
 
     Every value here came from the scanned repository or the finding, so every
-    value leaves fenced and bounded — see untrusted.py. The two that do not are
-    the ones used structurally rather than read as prose: file_path, which the
-    agent is told to open, and lines, which this function builds itself from two
-    integers.
+    value leaves fenced and bounded — see untrusted.py. The one that does not is
+    lines, which this function builds itself from two integers. file_path is
+    fenced too: the templates name it once, in the Location section, and refer
+    the agent there rather than interpolating it into a sentence.
     """
     position = alert.get("position", {}) or {}
     start_line = position.get("start_line")
@@ -401,8 +401,10 @@ def _build_prompt_context(alert: dict, nonce: str) -> dict:
     ai_explanation = ai_triage.get("explanation", "")
 
     return {
-        "file_path":  bound(alert.get("file_path") or alert.get("source", "(unknown)"),
-                            _PATH_LIMIT),
+        "file_path":  fence("file_path",
+                            bound(alert.get("file_path") or alert.get("source", "(unknown)"),
+                                  _PATH_LIMIT),
+                            nonce),
         "lines":      lines,
         "code_snippet":          fence("code_snippet", bound(code_snippet), nonce),
         "description":           fence("description", bound(alert.get("description", "")),
@@ -438,15 +440,17 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
         tools = pipeline.agent_tools(task.fix_plan)
         allowed = [t for t in tools if t != "Bash"] + pipeline.bash_allowlist(task.fix_plan)
 
-    # A specialist's directive goes after the type instructions and before the
-    # alert dump, so the concrete decision is the last thing read as guidance
-    # rather than being buried under reference material.
-    if task.fix_plan and task.fix_plan.prompt_extra:
-        instructions = f"{instructions}\n\n---\n\n{task.fix_plan.prompt_extra}"
-
     # One nonce per invocation, shared by every fence in this prompt, so alert
     # content cannot close a fence it was never told the name of.
     nonce = new_nonce()
+
+    # A specialist's directive goes after the type instructions and before the
+    # alert dump, so the concrete decision is the last thing read as guidance
+    # rather than being buried under reference material. It is rendered here
+    # because the values it states are fenced with this prompt's nonce.
+    directive = task.fix_plan.directive(nonce) if task.fix_plan else ""
+    if directive:
+        instructions = f"{instructions}\n\n---\n\n{directive}"
     ctx = _build_prompt_context(task.alert_json, nonce)
     prompt = tmpl.format(
         untrusted_preamble=preamble(nonce),

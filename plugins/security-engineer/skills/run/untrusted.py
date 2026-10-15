@@ -75,16 +75,20 @@ def fence(label: str, text, nonce: str) -> str:
 
     Any literal tag inside the content is stripped first. With a random nonce
     that is close to unreachable, but the fence is the whole defence and a
-    defence that depends on an attacker not guessing is worth one `replace`.
+    defence that depends on an attacker not guessing is worth a loop.
     """
     open_tag = f"<untrusted-{nonce} id=\"{label}\">"
     close_tag = f"</untrusted-{nonce}>"
     body = "" if text is None else str(text)
-    # Strip on the tag *prefix*, not the exact opening tag: content claiming a
-    # different id — `<untrusted-{nonce} id="code_snippet">` inside the
-    # description — would sail past an exact match and appear to open a second
-    # fence. Both spellings of the prefix, so the closer goes too.
-    body = body.replace(close_tag, "").replace(f"<untrusted-{nonce}", "")
+    # Strip on the tag *prefix*, not the exact tag: content claiming a different
+    # id — `<untrusted-{nonce} id="code_snippet">` inside the description — would
+    # sail past an exact match and appear to open a second fence. Repeated until
+    # nothing changes, because one pass over `</untrusted-N</untrusted-N>>`
+    # removes the inner tag and leaves the outer one reassembled.
+    prefixes = (f"</untrusted-{nonce}", f"<untrusted-{nonce}")
+    while any(prefix in body for prefix in prefixes):
+        for prefix in prefixes:
+            body = body.replace(prefix, "")
     return f"{open_tag}\n{body}\n{close_tag}"
 
 
