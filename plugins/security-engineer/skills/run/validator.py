@@ -410,39 +410,44 @@ def _find_project_root(files: list[str], worktree_path: Path, marker: str) -> Pa
     """Walk up from each file to find the nearest directory containing `marker`.
 
     Works for any project root indicator: go.mod, package.json, etc.
-    Falls back to worktree_path if not found.
+    Falls back to the worktree root if not found. Returns resolved paths.
     """
+    # resolve_within hands back resolved paths, so the root they are walked up
+    # to has to be resolved too. Comparing against the path as spelled never
+    # matched where the worktree sits under a symlink — on macOS /tmp is one —
+    # and every lookup fell back to the worktree root.
+    root = Path(worktree_path).resolve()
     for f in files:
         # Strip line number suffix (e.g. "nodejs-app/server.js:40" → "nodejs-app/server.js")
         clean = f.split(":")[0] if ":" in f else f
         # `worktree_path / clean` does not normalise, so a "../" in an alert's
-        # source used to walk straight out of the worktree — and the loop guard
-        # below compares paths lexicographically, which does not catch it.
-        inside = resolve_within(worktree_path, clean)
+        # source used to walk straight out of the worktree.
+        inside = resolve_within(root, clean)
         if inside is None:
             continue
         candidate = inside.parent
-        while candidate >= worktree_path:
+        while candidate == root or root in candidate.parents:
             if (candidate / marker).exists():
                 return candidate
-            if candidate == worktree_path:
+            if candidate == root:
                 break
             candidate = candidate.parent
-    return worktree_path
+    return root
 
 
 def _find_terraform_root(files: list[str], worktree_path: Path) -> Path:
     """Find the directory containing .tf files — the terraform module root."""
+    root = Path(worktree_path).resolve()
     for f in files:
         if not f.endswith(".tf"):
             continue
-        inside = resolve_within(worktree_path, f)
+        inside = resolve_within(root, f)
         if inside is None:
             continue
         tf_dir = inside.parent
         if tf_dir.exists():
             return tf_dir
-    return worktree_path
+    return root
 
 
 # Keep old names as aliases for backward compat with existing callers/tests

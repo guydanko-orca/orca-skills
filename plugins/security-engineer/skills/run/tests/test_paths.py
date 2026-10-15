@@ -56,11 +56,13 @@ class TestSafeName(unittest.TestCase):
 class TestResolveWithin(unittest.TestCase):
     """`Path.__truediv__` does not normalise, so the join has to be checked."""
 
+    # Results are resolved, so they are compared against the resolved root:
+    # on macOS /tmp is a symlink to /private/tmp.
     ROOT = "/tmp/orca-fix-owner-repo-1"
 
     def test_ordinary_relative_path_resolves(self):
         self.assertEqual(resolve_within(self.ROOT, "src/app.py"),
-                         Path(self.ROOT) / "src/app.py")
+                         Path(self.ROOT).resolve() / "src/app.py")
 
     def test_traversal_is_refused(self):
         self.assertIsNone(resolve_within(self.ROOT, "../../etc/passwd"))
@@ -68,7 +70,7 @@ class TestResolveWithin(unittest.TestCase):
     def test_traversal_that_returns_inside_is_allowed(self):
         """`a/../b` never leaves, and refusing it would fail honest alerts."""
         self.assertEqual(resolve_within(self.ROOT, "a/../b.py"),
-                         Path(self.ROOT) / "b.py")
+                         Path(self.ROOT).resolve() / "b.py")
 
     def test_absolute_path_is_refused(self):
         self.assertIsNone(resolve_within(self.ROOT, "/etc/passwd"))
@@ -84,7 +86,7 @@ class TestResolveWithin(unittest.TestCase):
             self.assertIsNone(resolve_within(root, "sub/link/secret.txt"))
 
     def test_empty_relative_is_the_root_itself(self):
-        self.assertEqual(resolve_within(self.ROOT, ""), Path(self.ROOT))
+        self.assertEqual(resolve_within(self.ROOT, ""), Path(self.ROOT).resolve())
 
 
 class TestAssertDisposable(unittest.TestCase):
@@ -233,13 +235,13 @@ class TestAlertPathsCannotEscapeTheWorktree(unittest.TestCase):
             root = Path(tmp)
             self.assertEqual(
                 validator._find_project_root(["../../etc/passwd"], root, "go.mod"),
-                root)
+                root.resolve())
 
     def test_terraform_root_ignores_a_traversing_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.assertEqual(
-                validator._find_terraform_root(["../../etc/x.tf"], root), root)
+                validator._find_terraform_root(["../../etc/x.tf"], root), root.resolve())
 
     def test_package_identity_refuses_a_traversing_manifest(self):
         src = __import__("inspect").getsource(package_identity.identify_package)

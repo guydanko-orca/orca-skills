@@ -1286,10 +1286,34 @@ class TestFindPackageJsonRoot(unittest.TestCase):
                 ),
             ]
 
+            # The worktree goes in as spelled, and the root comes back resolved.
+            # On macOS a temp dir lives under a symlink (/var -> /private/var),
+            # which is the case that used to fall back to the worktree root.
             for desc, files, expected in CASES:
                 with self.subTest(desc):
                     result = _find_package_json_root(files, tmp)
-                    self.assertEqual(result, expected, desc)
+                    self.assertEqual(result, expected.resolve(), desc)
+
+    def test_worktree_reached_through_a_symlink(self):
+        """The root is found even when the worktree path is not canonical.
+
+        Comparing a resolved candidate against an unresolved worktree path made
+        every lookup fall back to the worktree root — always, on macOS, where
+        /tmp is itself a symlink.
+        """
+        from validator import _find_package_json_root
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            real = Path(tmp_str) / "aa-real"
+            real.mkdir()
+            self._make_tree(real, {"package.json": None,
+                                   "app": {"package.json": None, "server.js": None}})
+            link = Path(tmp_str) / "zz-link"
+            link.symlink_to(real)
+            self.assertEqual(_find_package_json_root(["app/server.js"], link),
+                             (real / "app").resolve())
+            self.assertEqual(_find_package_json_root(["../../etc/passwd"], link),
+                             real.resolve())
 
 
 class TestFindProjectRoot(unittest.TestCase):
@@ -1355,7 +1379,7 @@ class TestFindProjectRoot(unittest.TestCase):
             for desc, fn, files, marker, expected in CASES:
                 with self.subTest(desc):
                     result = fn(files, tmp, marker) if marker else fn(files, tmp)
-                    self.assertEqual(result, expected, desc)
+                    self.assertEqual(result, expected.resolve(), desc)
 
 
 # ---------------------------------------------------------------------------
