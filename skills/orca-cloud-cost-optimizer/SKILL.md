@@ -29,7 +29,7 @@ Or natural language:
 
 ## Phase 1: Asset Discovery
 
-Use `mcp__orca-security__discovery_search` to enumerate assets. Run these searches **in parallel** to save time.
+Use the Orca MCP `discovery_search` tool to enumerate assets. Run these searches **in parallel** to save time.
 
 ### Compute
 - AWS: EC2 instances
@@ -69,7 +69,7 @@ Use `mcp__orca-security__discovery_search` to enumerate assets. Run these search
 - Associated tags — especially environment (prod/staging/dev), team, and service name
 - Creation date when available
 
-If `discovery_search` returns limited fields, use `mcp__orca-security__get_asset_by_id` to fetch full details on assets where you need more configuration data.
+If `discovery_search` returns limited fields, use the Orca MCP `get_asset_by_id` tool to fetch full details on assets where you need more configuration data.
 
 ---
 

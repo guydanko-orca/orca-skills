@@ -324,7 +324,7 @@ KILL CHAIN ASSESSMENT:
   Tactics covered: <N> of 10
   Chain completeness: <PARTIAL / NEAR-COMPLETE / COMPLETE>
   Missing for full chain: <tactics not observed>
-  
+
   Assessment: <interpretation of the ATT&CK coverage>
 
 ───────────────────────────────────────────────────────────────────

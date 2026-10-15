@@ -14,11 +14,15 @@
 
 ---
 
+Orca Skills supports both **Claude Code and Codex**. Both clients use the same
+`skills/` directory, with separate plugin manifests and installation instructions.
+
 ### Table of Contents
 - [Plugins](#plugins)
 - [Skills Overview](#skills-overview)
 - [Installation](#installation)
 - [MCP Configuration](#mcp-configuration)
+- [Usage Notes](#usage-notes)
 - [Skill Details](#skill-details)
 - [Testing](#testing)
 - [Contributing](#contributing)
@@ -34,7 +38,7 @@ people want the first one.
 
 | Plugin | What it is | Prerequisites |
 |---|---|---|
-| [`orca-skills`](#skills-overview) | 16 read-only skills that answer questions about your cloud environment through the Orca MCP server | The Orca MCP server. Nothing else |
+| [`orca-skills`](#skills-overview) | 20 skills for cloud security analysis and guided remediation through the Orca MCP server | The Orca MCP server. Nothing else |
 | [`security-engineer`](plugins/security-engineer/) | An autonomous agent that **remediates** Orca findings in your source code and opens a pull request per fix | Python 3.10+, authenticated [`gh`](https://cli.github.com/), `ORCA_API_TOKEN` in the environment, network access to OSV.dev and deps.dev |
 
 They answer different questions and are kept apart on purpose: `orca-skills`
@@ -97,13 +101,22 @@ second plugin or any of its prerequisites.
 Then install whichever plugins you want:
 
 ```bash
-claude plugin install orca-skills@orcasecurity          # the 16 MCP skills
+claude plugin install orca-skills@orcasecurity          # the MCP skills
 claude plugin install security-engineer@orcasecurity    # autonomous remediation
 ```
 
 **Next step:** Configure the Orca Security MCP server (see [MCP Configuration](#mcp-configuration) below).
 `security-engineer` does not use MCP — its setup is in
 [its own README](plugins/security-engineer/README.md).
+
+### Codex CLI
+
+```bash
+codex plugin marketplace add orcasecurity/orca-skills
+codex plugin add orca-skills --marketplace orcasecurity
+```
+
+This installs `orca-skills` from the root `skills/` directory. Configure the Orca Security MCP server using the [Codex instructions](#codex-mcp-configuration) below. The separate `security-engineer` plugin uses Claude Code; see [its README](plugins/security-engineer/README.md).
 
 ### Claude Desktop
 
@@ -118,11 +131,17 @@ cd orca-skills
 
 # Copy skills to your skills directory
 cp -r skills/* ~/.claude/skills/
+
+# Or install into Codex's user skills directory
+mkdir -p ~/.agents/skills
+cp -r skills/* ~/.agents/skills/
 ```
 
 ## MCP Configuration
 
 **Required:** These skills need the Orca Security MCP server to access your environment data.
+
+### Claude Code / Claude Desktop
 
 Add to your `.mcp.json` (in project root or `~/.claude/.mcp.json`):
 
@@ -163,6 +182,42 @@ Add to your `.mcp.json` (in project root or `~/.claude/.mcp.json`):
 > token in `ORCA_API_TOKEN` as an environment variable rather than in
 > `.mcp.json`. Configuring one does not configure the other.
 
+
+### Codex MCP Configuration
+
+For OAuth2 authentication:
+
+```bash
+codex mcp add orca-security --url https://mcp.orcasecurity.io
+codex mcp login orca-security
+```
+
+For token based authentication, set the authorization value in an environment variable:
+
+```bash
+export ORCA_AUTHORIZATION="Token YOUR_ORCA_API_TOKEN"
+```
+
+Reference the variable in `~/.codex/config.toml` (or `$CODEX_HOME/config.toml` when using a custom home):
+
+```toml
+[mcp_servers.orca-security]
+url = "https://api.orcasecurity.io/mcp"
+env_http_headers = { Authorization = "ORCA_AUTHORIZATION" }
+```
+
+Check the connection with `codex mcp list`. See the [official Codex MCP documentation](https://developers.openai.com/codex/mcp/).
+
+## Usage Notes
+
+Claude examples use slash commands such as `/orca-alert-triage`. In Codex, use natural language or explicitly mention the installed skill:
+
+```text
+triage Orca alert orca-1234567
+$orca-skills:orca-morning-briefing what needs attention today?
+```
+
+For a manually copied skill, use its standalone name, such as `$orca-morning-briefing`.
 
 ## Skill Details
 
@@ -1439,6 +1494,32 @@ ADMIN GROUPING SUMMARY  (window: last 90 days; artifact: daily snapshot)
 [Full Documentation →](skills/orca-admin-access-grouping/)
 
 </details>
+
+## Testing
+
+With Node.js 20+ installed, run the packaging validation and regression tests:
+
+```bash
+npm test
+```
+
+These dependency-free checks validate the Claude, Cursor, and Codex manifests, the marketplace sources, and each root skill's metadata. The packaging workflow runs them on every pull request.
+
+### Codex Smoke Test
+
+With Codex CLI installed, verify the complete local marketplace install:
+
+```bash
+npm run test:codex
+```
+
+The script uses a temporary Codex home, runs outside the repository, installs the root plugin, compares every installed skill and reference file with `skills/`, and verifies that Codex discovers the skills from the installed cache. It removes its temporary files on completion. This tests packaging and discovery without an Orca account or model call; it does not exercise the Orca MCP workflows.
+
+### Claude Smoke Test
+
+After installing the marketplace in Claude Code, run `claude mcp list` to check the Orca MCP connection, then try `/orca-alert-triage` with an alert from your environment.
+
+The separate `security-engineer` tests and development setup are documented in [its README](plugins/security-engineer/README.md#developing).
 
 ## Contributing
 

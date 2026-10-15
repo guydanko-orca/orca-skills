@@ -41,7 +41,7 @@ Queries the Orca environment to gather existing controls and alerts:
 
 These are read-only MCP queries. They provide the `rule_id` values needed for the framework.
 
-### Phase 2: Organize (Claude logic — no API calls)
+### Phase 2: Organize (assistant logic — no API calls)
 
 Groups the gathered `rule_id` values into logical sections based on alert categories, asset types, and the requested theme. Assigns priority weights (`high`/`medium`/`low`) and dotted-notation IDs (e.g., `1.1`, `2.3`).
 

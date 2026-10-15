@@ -45,7 +45,7 @@ ALERT TIMELINE
 
 BEHAVIORAL PATTERN / VULNERABILITY LIFECYCLE:
   [Visual timeline with key events]
-  
+
 RECURRENCE: <pattern analysis>
 ESCALATION: <status change summary>
 RED FLAGS: <critical indicators if present>
@@ -411,7 +411,9 @@ Possible reasons:
 
 Try:
 1. Verify alert ID in Orca UI
-2. Check MCP status: `claude mcp list`
+2. Check MCP status:
+   - Claude Code: `claude mcp list`
+   - Codex: `codex mcp list`
 3. Re-authenticate if needed
 ```
 

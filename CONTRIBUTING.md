@@ -22,7 +22,7 @@ If a skill produces unexpected output, fails to trigger, or behaves incorrectly:
    - The skill name (e.g., `orca-alert-triage`)
    - The exact prompt or input you used
    - What you expected vs. what you got
-   - Your Claude Code version (`claude --version`) and OS
+   - Your client and version (`claude --version` or `codex --version`) and OS
    - Any error output or unexpected MCP behavior
 
 > For security vulnerabilities, **do not open a public issue**. See [SECURITY.md](SECURITY.md).
@@ -43,13 +43,22 @@ This avoids wasted effort and keeps the repo focused.
 
 ## Development Setup
 
+Skills are plain Markdown files under `skills/<skill-name>/SKILL.md`. There is no build step or runtime dependency to author them. Node.js 20+ is required to run the repository packaging checks.
+
 ```bash
 # Fork and clone
 git clone https://github.com/<your-username>/orca-skills.git
 cd orca-skills
+
+# Validate plugin packaging and run regression tests
+npm test
 ```
 
-Skills are plain Markdown files under `skills/<skill-name>/SKILL.md` — no build step or runtime is required to author or modify them. Install them via the Claude Code plugin marketplace (see [README](README.md)) to try them locally.
+Claude, Cursor, and Codex all use this single root `skills/` tree. Edit it once; do not create copies under `plugins/orca-skills/`. `npm test` checks the plugin manifests, marketplace sources, and skill metadata. With Codex CLI installed, `npm run test:codex` also verifies installation and discovery in a temporary home. See [README](README.md#testing).
+
+Keep shared skill instructions usable in both Claude and Codex. Label client-specific setup commands and usage examples clearly.
+
+The independent `security-engineer` plugin has its own [development setup and test suite](plugins/security-engineer/README.md#developing).
 
 **Note:** `.mcp.json` is gitignored. Never commit API tokens or credentials.
 
@@ -64,7 +73,7 @@ Skills are plain Markdown files under `skills/<skill-name>/SKILL.md` — no buil
    git checkout -b docs/update-readme
    ```
 
-2. **Make your changes.** Edit or add `SKILL.md` files under `skills/<skill-name>/`.
+2. **Make your changes.** Edit or add `SKILL.md` files under `skills/<skill-name>/`. Run `npm test` before pushing; the packaging workflow runs it on every pull request.
 
 3. **Keep PRs focused.** One bug fix or one new skill per PR. Do not bundle unrelated changes.
 
@@ -77,9 +86,10 @@ Skills are plain Markdown files under `skills/<skill-name>/SKILL.md` — no buil
 5. **PR description** must include:
    - What changed and why
    - A link to the related issue (if applicable)
-   - For new skills: a brief validation note (did you test with a real Orca environment?)
+   - Confirmation that `npm test` passes locally
+   - For new skills: a brief Claude and/or Codex validation note, including whether you tested with a real Orca environment
 
-6. **One approving review** from a maintainer is required to merge.
+6. **CI must pass**, and one approving review from a maintainer is required to merge.
 
 ---
 
