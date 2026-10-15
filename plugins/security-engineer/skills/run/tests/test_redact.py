@@ -440,6 +440,36 @@ class TestRedactBeforeTruncate(unittest.TestCase):
             result = impact_agent.analyze_impact(SECRET_ALERT, "diff")
         self._assert_clean(f"{result.error} {result.description} {out.getvalue()}")
 
+    def test_build_check_output(self):
+        """`npm run build` can print the file it chokes on, credential included."""
+        import sys
+        import tempfile
+        out = self._straddling(400)
+        with tempfile.TemporaryDirectory() as d:
+            result = validator._run_check(
+                [sys.executable, "-c", f"import sys; sys.stderr.write({out!r}); sys.exit(1)"],
+                Path(d), redactor=build_redactor(SECRET_ALERT))
+        self.assertFalse(result.passed)
+        self._assert_clean(" ".join(result.failures))
+
+    def test_python_syntax_check_output(self):
+        """py_compile quotes the offending source line."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "bad.py").write_text(f'KEY = "{SECRET}" +\n')
+            result = validator._check_python(["bad.py"], root,
+                                             redactor=build_redactor(SECRET_ALERT))
+        self.assertFalse(result.passed)
+        self.assertNotIn(SECRET[:8] + SECRET[8:12], " ".join(result.failures))
+
+    def test_pipelines_hand_the_build_check_a_redactor(self):
+        import inspect
+
+        from pipelines import base, cve
+        self.assertIn("redactor=build_redactor(", inspect.getsource(base.FixPipeline.verify))
+        self.assertIn("redactor=build_redactor(", inspect.getsource(cve.CvePipeline.verify))
+
     def test_fix_agent_crash(self):
         task = orchestrator.AlertTask(
             alert_id="orca-abc123", title="t", risk_level="high",

@@ -19,6 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from redact import build_redactor
 from validator import ValidationResult, local_build_check
 
 
@@ -98,4 +99,5 @@ class FixPipeline:
         return local_build_check(
             files, worktree_path,
             source_file=alert.get("file_path") or alert.get("source", ""),
+            redactor=build_redactor(alert),
         )

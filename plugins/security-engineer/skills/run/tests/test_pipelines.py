@@ -22,7 +22,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 _DIR = Path(__file__).parent
 sys.path.insert(0, str(_DIR.parent))                 # security-engineer/
@@ -215,7 +215,8 @@ class TestGenericPipelineIsUnchanged(unittest.TestCase):
             got = get_pipeline("sast").verify(task, Path("/tmp/wt"))
         self.assertIs(got, expected)
         mock_build.assert_called_once_with(["app/server.js"], Path("/tmp/wt"),
-                                           source_file="app/server.js")
+                                           source_file="app/server.js",
+                                           redactor=ANY)
 
     def test_verify_falls_back_to_source_when_file_path_is_absent(self):
         task = _task("sast", alert={"source": "app/server.js:40"},

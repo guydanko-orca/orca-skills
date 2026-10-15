@@ -406,12 +406,15 @@ def local_build_check(
     files_changed: list[str],
     worktree_path: Path,
     source_file: str = "",
+    redactor=None,
 ) -> ValidationResult:
     """Run a language-appropriate build check after a fix is applied.
 
     source_file: the affected file path from the Orca alert (authoritative).
                  Used as the primary seed for project-root detection; falls back
                  to files_changed if empty.
+    redactor:    applied to build output before it is cut — a compiler quotes the
+                 line it fails on, which for a secret fix is the credential.
     """
     # Seed with the alert's source file first — it's authoritative and available
     # before the fix agent runs, unlike files_changed which comes from agent output.
@@ -423,15 +426,15 @@ def local_build_check(
 
     if ext == ".go":
         go_root = _find_project_root(all_files, worktree_path, "go.mod")
-        return _run_check(["go", "build", "./..."], go_root)
+        return _run_check(["go", "build", "./..."], go_root, redactor)
     elif ext == ".py":
-        return _check_python(files_changed, worktree_path)
+        return _check_python(files_changed, worktree_path, redactor)
     elif ext in (".js", ".ts"):
         npm_root = _find_project_root(all_files, worktree_path, "package.json")
-        return _run_check(["npm", "run", "build", "--if-present"], npm_root)
+        return _run_check(["npm", "run", "build", "--if-present"], npm_root, redactor)
     elif ext == ".tf":
         tf_root = _find_terraform_root(all_files, worktree_path)
-        return _run_check(["terraform", "validate"], tf_root)
+        return _run_check(["terraform", "validate"], tf_root, redactor)
     else:
         # No build check for YAML/Dockerfile/etc. — skip gracefully
         return ValidationResult(passed=True, phase="local_build")
@@ -490,7 +493,7 @@ def _find_go_module_root(files: list[str], worktree_path: Path) -> Path:
     return _find_project_root(files, worktree_path, "go.mod")
 
 
-def _run_check(cmd: list[str], cwd: Path) -> ValidationResult:
+def _run_check(cmd: list[str], cwd: Path, redactor=None) -> ValidationResult:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=cwd,
                                 env=build_env())
@@ -500,13 +503,13 @@ def _run_check(cmd: list[str], cwd: Path) -> ValidationResult:
     except FileNotFoundError:
         return ValidationResult(passed=True, phase="local_build")  # tool not installed — skip
     if result.returncode != 0:
-        out = (result.stdout + result.stderr)[:400]
+        out = (redactor or build_redactor(None))(result.stdout + result.stderr)[:400]
         return ValidationResult(passed=False, phase="local_build",
                                 failures=[f"local build failed: {out}"])
     return ValidationResult(passed=True, phase="local_build")
 
 
-def _check_python(files: list[str], cwd: Path) -> ValidationResult:
+def _check_python(files: list[str], cwd: Path, redactor=None) -> ValidationResult:
     failures = []
     for f in files:
         if not f.endswith(".py"):
@@ -518,7 +521,8 @@ def _check_python(files: list[str], cwd: Path) -> ValidationResult:
             capture_output=True, text=True, timeout=15, env=build_env(),
         )
         if result.returncode != 0:
-            failures.append(f"syntax error in {f}: {result.stderr[:150]}")
+            detail = (redactor or build_redactor(None))(result.stderr)[:150]
+            failures.append(f"syntax error in {f}: {detail}")
     return ValidationResult(passed=len(failures) == 0, phase="local_build", failures=failures)
 
 

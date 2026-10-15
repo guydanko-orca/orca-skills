@@ -20,6 +20,7 @@ from pathlib import Path
 
 from package_identity import find_dependency, identify_package, read_manifest
 from paths import resolve_within
+from redact import build_redactor
 from untrusted import bound, fence
 from validator import ValidationResult, _find_project_root, _run_check
 
@@ -322,7 +323,8 @@ class CvePipeline(FixPipeline):
             return ValidationResult(passed=False, phase="local_build",
                                     failures=failures)
 
-        return self._resolve_check(ref, manifest_rel, worktree_path)
+        return self._resolve_check(ref, manifest_rel, worktree_path,
+                                   redactor=build_redactor(task.alert_json))
 
     def _applied_version(self, manifest_abs: Path, package: str, ref: dict):
         """The version the manifest declares now, or None if it is gone."""
@@ -354,7 +356,7 @@ class CvePipeline(FixPipeline):
         return ""
 
     def _resolve_check(self, ref: dict, manifest_rel: str,
-                       worktree_path: Path) -> ValidationResult:
+                       worktree_path: Path, redactor=None) -> ValidationResult:
         """Run the ecosystem's own check, where one is cheap and offline."""
         eco_key = ref.get("ecosystem")
         entry = _RESOLVE_CHECKS.get(eco_key)
@@ -362,7 +364,7 @@ class CvePipeline(FixPipeline):
             return ValidationResult(passed=True, phase="local_build")
         cmd, marker = entry
         root = _find_project_root([manifest_rel], Path(worktree_path), marker)
-        return _run_check(cmd, root)
+        return _run_check(cmd, root, redactor)
 
     # -- helpers -----------------------------------------------------------
 
