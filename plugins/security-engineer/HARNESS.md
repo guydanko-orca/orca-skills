@@ -282,7 +282,16 @@ allowlist cannot be undone by accident. The local build checks (`npm run build`,
 tenant wrote, so they get the same allowlist through `build_env()` with Claude's
 own credentials removed as well. `HOME` is still passed, so a build script can
 read credential files under it (`~/.config/gh`, `~/.aws`, `~/.npmrc`); closing
-that needs a sandbox, not an environment. The orchestrator's own `gh` and `git`
+that needs a sandbox, not an environment. Pointing `HOME` at a throwaway
+directory was evaluated and not done. It would not close the hole — the build
+runs as the same user, so `pwd.getpwuid()` or `/Users/$USER/.aws` reaches the
+same files by absolute path — and it breaks the checks it would wrap: with an
+empty `HOME`, an offline `go build` could no longer find the module cache
+(measured), so a gate that passes today fails or goes to the network. Keeping
+them working means pinning `GOMODCACHE`/`GOCACHE` and `CARGO_HOME`/`RUSTUP_HOME`
+back to the real home, and `CARGO_HOME` is where `credentials.toml` lives; cargo
+is not installed where this was evaluated, so that half was not measured at all.
+The orchestrator's own `gh` and `git`
 subprocesses keep their environment: they need those credentials and are not the
 untrusted party. The hooks a repository attaches to them are — see *Repository
 hooks do not run on the plugin's git* below.

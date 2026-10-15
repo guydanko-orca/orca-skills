@@ -25,7 +25,9 @@ from config import load_config
 # prefix rule written for npm. Values are read from the real environment at call
 # time, so nothing in this file holds a secret.
 _ALLOW = frozenset({
-    # process and shell basics
+    # process and shell basics. HOME stays real even for build checks: a
+    # throwaway one hides no file from code running as this user, and it
+    # breaks toolchain caches — see HARNESS.md.
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL",
     "LC_CTYPE", "TERM", "TZ",
     # TLS trust and proxies — without these a corporate network breaks the call
