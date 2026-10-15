@@ -19,6 +19,9 @@ _DIR = Path(__file__).parent
 sys.path.insert(0, str(_DIR.parent))
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))
 
+sys.path.insert(0, str(_DIR))                        # tests/
+import _git_sandbox  # noqa: F401  (hermetic git config snapshot)
+import agent_env
 import orchestrator
 import package_identity
 import validator
@@ -291,6 +294,10 @@ class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
         self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
                                            "GIT_CONFIG_NOSYSTEM": "1"})
         self.env.start()
+        # The plugin's git reads its snapshot of the global config; take it
+        # from the empty config above, not from the developer's own.
+        self._saved_snapshot = agent_env._snapshot_path
+        agent_env._reset_git_config_snapshot()
         self.remote = base / "remote.git"
         self.work = base / "work"
         git = lambda *a, cwd=None: subprocess.run(  # noqa: E731
@@ -326,6 +333,7 @@ class TestRepoHooksDoNotRunOnPluginGit(unittest.TestCase):
     def tearDown(self):
         os.chdir(self.cwd)
         self.env.stop()
+        agent_env._snapshot_path = self._saved_snapshot
         self._tmp.cleanup()
 
     def fired(self):
@@ -419,6 +427,10 @@ class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
         self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
                                            "GIT_CONFIG_NOSYSTEM": "1"})
         self.env.start()
+        # The plugin's git reads its snapshot of the global config; take it
+        # from the empty config above, not from the developer's own.
+        self._saved_snapshot = agent_env._snapshot_path
+        agent_env._reset_git_config_snapshot()
         self.work = Path(self._tmp.name) / "work"
         self.git = lambda *a: subprocess.run(
             ["git", *a], cwd=self.work, check=True, capture_output=True, text=True)
@@ -429,6 +441,7 @@ class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
 
     def tearDown(self):
         self.env.stop()
+        agent_env._snapshot_path = self._saved_snapshot
         self._tmp.cleanup()
 
     def test_unchanged_config_is_not_drift(self):
@@ -478,6 +491,93 @@ class TestFixAgentCannotRewriteGitConfig(unittest.TestCase):
         self.assertEqual(src.count('config_drifted("'), guarded)
 
 
+class TestGitConfigIsReadOnceAtStart(unittest.TestCase):
+    """Build checks keep the real HOME, so they can write ~/.gitconfig — and in
+    --remote all, every later clone would read it. Plugin git reads a private
+    snapshot of the operator's global and system config, taken once."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.included = base / "included.cfg"
+        self.included.write_text("[user]\n\tname = from-include\n")
+        self.global_cfg = base / "global.cfg"
+        self.global_cfg.write_text(f"[core]\n\tsshCommand = ssh-original\n"
+                                   f"[include]\n\tpath = {self.included}\n")
+        self.env = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(self.global_cfg),
+                                           "GIT_CONFIG_NOSYSTEM": "1"})
+        self.env.start()
+        self._saved_snapshot = agent_env._snapshot_path
+        agent_env._reset_git_config_snapshot()
+        os.environ.pop(agent_env.GIT_SNAPSHOT_ENV, None)
+
+    def tearDown(self):
+        self.env.stop()
+        agent_env._snapshot_path = self._saved_snapshot
+        self._tmp.cleanup()
+
+    def _get(self, key):
+        import subprocess
+        return subprocess.run(["git", "config", "--get", key], cwd=self._tmp.name,
+                              capture_output=True, text=True,
+                              env=agent_env.git_env()).stdout.strip()
+
+    def test_a_rewritten_global_config_is_not_seen(self):
+        snapshot = agent_env.git_config_snapshot()
+        self.global_cfg.write_text("[core]\n\tsshCommand = ssh-evil\n")
+        self.included.write_text("[user]\n\tname = evil\n")
+        self.assertEqual(self._get("core.sshCommand"), "ssh-original")
+        self.assertEqual(self._get("user.name"), "from-include")
+        text = Path(snapshot).read_text().lower()
+        self.assertNotIn("[include", text, "includes are inlined, not followed again")
+        self.assertNotIn(str(self.included).lower(), text)
+        self.assertNotIn("osxkeychain", text, "GIT_CONFIG_NOSYSTEM=1 is honoured")
+
+    def test_the_snapshot_is_private(self):
+        snapshot = Path(agent_env.git_config_snapshot())
+        self.assertEqual(snapshot.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(snapshot.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_child_processes_inherit_the_same_snapshot(self):
+        env = agent_env.git_env()
+        self.assertEqual(env[agent_env.GIT_SNAPSHOT_ENV], env["GIT_CONFIG_GLOBAL"])
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        agent_env._reset_git_config_snapshot()
+        with patch.dict(os.environ, {agent_env.GIT_SNAPSHOT_ENV: env["GIT_CONFIG_GLOBAL"]}):
+            self.assertEqual(agent_env.git_config_snapshot(), env["GIT_CONFIG_GLOBAL"])
+
+    def test_old_git_fails_closed(self):
+        with patch.object(agent_env, "_git_version", return_value=(2, 31)), \
+             self.assertRaises(RuntimeError):
+            agent_env.git_config_snapshot()
+
+    def test_every_git_and_gh_call_site_passes_the_isolated_env(self):
+        import inspect
+        import re
+
+        import run_agent
+        for module in (orchestrator, validator, run_agent):
+            src = inspect.getsource(module)
+            for call in re.finditer(r"subprocess\.run\(\s*(\[[^\n]*?\]|cmd)", src):
+                head = call.group(1)
+                if not re.search(r'"git"|"gh"|HOOKLESS_GIT|^cmd$', head):
+                    continue
+                window = src[call.start():call.start() + 400]
+                with self.subTest(module=module.__name__, call=head[:40]):
+                    self.assertIn("env=", window)
+
+    def test_the_clone_reads_the_snapshot(self):
+        from orca_client import Repository
+        snapshot = agent_env.git_config_snapshot()
+        with patch("orchestrator.subprocess.run") as run, \
+             patch("orchestrator.shutil.rmtree"):
+            run.return_value.returncode = 0
+            run.return_value.stdout = ""
+            orchestrator._clone_repo(Repository(name="o/r", url="https://github.com/o/r"))
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], snapshot)
+
+
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -492,6 +592,7 @@ if __name__ == "__main__":
         TestAlertPathsCannotEscapeTheWorktree,
         TestRepoHooksDoNotRunOnPluginGit,
         TestFixAgentCannotRewriteGitConfig,
+        TestGitConfigIsReadOnceAtStart,
     ]
 
     _registered = {cls.__name__ for cls in test_classes}

@@ -16,8 +16,13 @@ The orchestrator's own `gh` and `git` subprocesses keep their environment. They
 need those credentials, and they are not the untrusted party — but the hooks a
 repository can attach to them are, so they run through HOOKLESS_GIT.
 """
+import atexit
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+import threading
 
 from config import load_config
 
@@ -142,3 +147,107 @@ def build_env(extra: list | None = None) -> dict:
     """
     return {k: v for k, v in agent_env(extra).items()
             if not k.startswith(_MODEL_ONLY_PREFIXES)}
+
+
+# ---------------------------------------------------------------------------
+# The git configuration every plugin git call reads
+# ---------------------------------------------------------------------------
+
+# Where a child process (run_agent.py) finds the snapshot its parent made, so a
+# run reads the operator's global config exactly once.
+GIT_SNAPSHOT_ENV = "SECURITY_ENGINEER_GIT_CONFIG"
+
+_snapshot_path: str | None = None
+_snapshot_lock = threading.Lock()
+
+# GIT_CONFIG_GLOBAL, the override everything here rests on, arrived in git 2.32.
+_MIN_GIT = (2, 32)
+
+# Their targets are inlined by --includes when the snapshot is taken. Kept, git
+# would follow them again to live files under HOME — which build code can write.
+_INCLUDE_KEY = re.compile(r"^(include|includeif\..*)\.path$", re.IGNORECASE)
+
+
+def _git_version() -> tuple:
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
+def _scope_entries(scope: str, cwd: str) -> list[tuple[str, str]]:
+    r = subprocess.run(["git", "config", scope, "--list", "-z", "--includes"],
+                       cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0:
+        # No ~/.gitconfig at all is an empty global config, not an error.
+        if "No such file or directory" in r.stderr:
+            return []
+        raise RuntimeError(f"could not read the {scope[2:]} git config: "
+                           f"{r.stderr.strip()[:200]}")
+    entries = []
+    for raw in r.stdout.split("\0"):
+        if not raw:
+            continue
+        key, newline, value = raw.partition("\n")
+        if _INCLUDE_KEY.match(key):
+            continue
+        # A valueless key is a boolean true.
+        entries.append((key, value if newline else "true"))
+    return entries
+
+
+def _write_snapshot() -> str:
+    if _git_version() < _MIN_GIT:
+        raise RuntimeError("git >= 2.32 is required: the plugin isolates every git "
+                           "call from ~/.gitconfig with GIT_CONFIG_GLOBAL")
+    directory = tempfile.mkdtemp(prefix="security-engineer-git-")   # 0700
+    atexit.register(shutil.rmtree, directory, ignore_errors=True)
+    path = os.path.join(directory, "gitconfig")
+    os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    # Read from a directory with no repository, so no repo config is mixed in;
+    # system first, so a global value later in the file wins as it does in git.
+    no_system = os.environ.get("GIT_CONFIG_NOSYSTEM", "").lower() in ("1", "true", "yes")
+    system = [] if no_system else _scope_entries("--system", directory)
+    for key, value in (*system, *_scope_entries("--global", directory)):
+        subprocess.run(["git", "config", "--file", path, "--add", key, value],
+                       cwd=directory, check=True, capture_output=True)
+    return path
+
+
+def git_config_snapshot() -> str:
+    """The plugin's private copy of the operator's system + global git config.
+
+    Taken once, at the first call — orchestrator.main() makes that the start of
+    the run — and inherited by child processes through GIT_SNAPSHOT_ENV. Every
+    plugin git call reads it through GIT_CONFIG_GLOBAL with system config off,
+    so a build check that rewrites ~/.gitconfig mid-run changes nothing the
+    plugin's git sees, for this alert or for a repository cloned later.
+    """
+    global _snapshot_path
+    with _snapshot_lock:
+        if _snapshot_path is None:
+            inherited = os.environ.get(GIT_SNAPSHOT_ENV)
+            _snapshot_path = (inherited if inherited and os.path.isfile(inherited)
+                              else _write_snapshot())
+        return _snapshot_path
+
+
+def _reset_git_config_snapshot() -> None:
+    """Tests only: forget the snapshot so the next call takes a fresh one."""
+    global _snapshot_path
+    with _snapshot_lock:
+        _snapshot_path = None
+
+
+def isolate_git_config(env: dict) -> dict:
+    """Point a git (or gh) environment at the snapshot, and nothing else."""
+    for name in [k for k in env if k.startswith("GIT_CONFIG")]:
+        del env[name]
+    env["GIT_CONFIG_GLOBAL"] = git_config_snapshot()
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env[GIT_SNAPSHOT_ENV] = env["GIT_CONFIG_GLOBAL"]
+    return env
+
+
+def git_env() -> dict:
+    """The orchestrator's environment for git and gh, with the snapshot config."""
+    return isolate_git_config(dict(os.environ))

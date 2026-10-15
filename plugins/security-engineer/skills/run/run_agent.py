@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
-from agent_env import HOOKLESS_GIT
+from agent_env import HOOKLESS_GIT, git_env
 from orca_client import (
     RISK_ORDER,
     _resolve_feature_type,
@@ -38,7 +38,7 @@ def run(cmd, check=True, capture=True, cwd=None):
     """Run a shell command. Returns (stdout, stderr, returncode)."""
     result = subprocess.run(
         cmd, shell=isinstance(cmd, str),
-        capture_output=capture, text=True, cwd=cwd
+        capture_output=capture, text=True, cwd=cwd, env=git_env()
     )
     if check and result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"Command failed: {cmd}")

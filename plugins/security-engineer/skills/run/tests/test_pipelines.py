@@ -28,6 +28,8 @@ _DIR = Path(__file__).parent
 sys.path.insert(0, str(_DIR.parent))                 # security-engineer/
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # lib/
 
+sys.path.insert(0, str(_DIR))                        # tests/
+import _git_sandbox  # noqa: F401  (hermetic git config snapshot)
 import orchestrator
 from orchestrator import TIMEOUTS, AlertTask, FixAgentResult
 from pipelines import CvePipeline, FixPipeline, FixPlan, get_pipeline

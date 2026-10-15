@@ -25,7 +25,7 @@ sys.path.insert(0, str(_SKILLS_DIR / "lib"))
 sys.path.insert(0, str(_THIS_DIR))
 
 from _json_util import find_last_json_with_key
-from agent_env import HOOKLESS_GIT, agent_env
+from agent_env import HOOKLESS_GIT, agent_env, git_config_snapshot, git_env
 from config import load_config
 from impact_agent import ImpactResult, analyze_impact
 from notifier import NotificationPayload, build_notifiers
@@ -150,7 +150,9 @@ class AlertTask:
 # ---------------------------------------------------------------------------
 
 def _run(cmd: list[str], check: bool = True, cwd: Path | None = None) -> tuple[str, str, int]:
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    # git_env(): every git and gh call — and run_agent.py, which makes more —
+    # reads the plugin's snapshot of the global git config, never ~/.gitconfig.
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=git_env())
     if check and r.returncode != 0:
         # Fall back to stdout before giving up on a message. run_agent.py reports
         # failures as JSON on stdout ({"error": "Alert … not found"}) and writes
@@ -187,7 +189,7 @@ def _worktree_path(alert_id: str, repo: Repository | None = None) -> Path:
 def _local_branch_exists(branch: str, cwd: str | None) -> bool:
     r = subprocess.run(["git", "rev-parse", "--verify", "--quiet",
                         f"refs/heads/{branch}"],
-                       capture_output=True, text=True, cwd=cwd)
+                       capture_output=True, text=True, cwd=cwd, env=git_env())
     return r.returncode == 0
 
 
@@ -199,7 +201,7 @@ def _branch_has_own_commits(branch: str, cwd: str | None) -> bool:
     cannot inspect counts as having commits, so we never force-delete blindly.
     """
     r = subprocess.run(["git", "rev-list", "--count", f"{BASE_BRANCH}..{branch}"],
-                       capture_output=True, text=True, cwd=cwd)
+                       capture_output=True, text=True, cwd=cwd, env=git_env())
     if r.returncode != 0:
         return True
     count = (r.stdout or "").strip()
@@ -223,11 +225,12 @@ def _create_worktree(alert_id: str, branch: str, repo: Repository | None = None)
     cwd = str(repo.clone_path) if (repo and repo.clone_path) else None
 
     # Drop registrations whose directories no longer exist.
-    subprocess.run([*HOOKLESS_GIT, "worktree", "prune"], capture_output=True, cwd=cwd)
+    subprocess.run([*HOOKLESS_GIT, "worktree", "prune"], capture_output=True, cwd=cwd,
+                   env=git_env())
 
     if path.exists():
         subprocess.run([*HOOKLESS_GIT, "worktree", "remove", "--force", str(path)],
-                       capture_output=True, cwd=cwd)
+                       capture_output=True, cwd=cwd, env=git_env())
         if path.exists():
             # Not a registered worktree of this repo — e.g. the clone it belonged
             # to was already deleted. Ours by naming convention, and now checked
@@ -242,7 +245,8 @@ def _create_worktree(alert_id: str, branch: str, repo: Repository | None = None)
             raise WorktreeConflict(
                 f"local branch {branch} has commits not in {BASE_BRANCH} — "
                 f"left untouched for review")
-        subprocess.run([*HOOKLESS_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd)
+        subprocess.run([*HOOKLESS_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd,
+                       env=git_env())
 
     _, stderr, rc = _run([*HOOKLESS_GIT, "worktree", "add", "-b", branch, str(path),
                           BASE_BRANCH], check=False, cwd=cwd)
@@ -263,9 +267,10 @@ def _remove_worktree(path: Path | None, branch: str | None = None,
     cwd = str(repo.clone_path) if (repo and repo.clone_path) else None
     if path and path.exists():
         subprocess.run([*HOOKLESS_GIT, "worktree", "remove", "--force", str(path)],
-                       capture_output=True, cwd=cwd)
+                       capture_output=True, cwd=cwd, env=git_env())
     if branch:
-        subprocess.run([*HOOKLESS_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd)
+        subprocess.run([*HOOKLESS_GIT, "branch", "-D", branch], capture_output=True, cwd=cwd,
+                       env=git_env())
 
 
 # The effective git config of each clone, keyed by its common git dir, as first
@@ -288,7 +293,8 @@ def _git_config_snapshot(worktree: Path) -> str | None:
     """
     try:
         r = subprocess.run(["git", "config", "--list", "--show-scope", "--includes"],
-                           cwd=worktree, capture_output=True, text=True, timeout=30)
+                           cwd=worktree, capture_output=True, text=True, timeout=30,
+                           env=git_env())
     except (OSError, subprocess.TimeoutExpired):
         return None
     return r.stdout if r.returncode == 0 else None
@@ -298,7 +304,8 @@ def _config_key(worktree: Path) -> str:
     try:
         r = subprocess.run(["git", "rev-parse", "--path-format=absolute",
                             "--git-common-dir"],
-                           cwd=worktree, capture_output=True, text=True, timeout=30)
+                           cwd=worktree, capture_output=True, text=True, timeout=30,
+                           env=git_env())
         if r.returncode == 0 and str(r.stdout).strip():
             return str(r.stdout).strip()
     except (OSError, subprocess.TimeoutExpired):
@@ -742,7 +749,7 @@ def _ensure_label(owner_repo: str, label: str) -> None:
     r = subprocess.run(
         ["gh", "label", "create", label, "--repo", owner_repo,
          "--color", color, "--description", description, "--force"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=git_env(),
     )
     if r.returncode != 0:
         print(f"[WARN] could not create label {label} in {owner_repo}: {r.stderr[:200]}")
@@ -759,7 +766,7 @@ def _add_label(pr_url: str, label: str) -> None:
     if owner_repo:
         _ensure_label(owner_repo, label)
     r = subprocess.run(["gh", "pr", "edit", pr_url, "--add-label", label],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=git_env())
     if r.returncode != 0:
         print(f"[WARN] failed to add {label} label: {r.stderr[:200]}")
 
@@ -873,7 +880,7 @@ def _sync_pr_body(task: AlertTask) -> None:
     if body == task.pr_body:
         return
     r = subprocess.run(["gh", "pr", "edit", task.pr_url, "--body", body],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=git_env())
     if r.returncode != 0:
         print(f"[WARN] could not update PR body with review reasons: {r.stderr[:200]}")
         return
@@ -958,7 +965,7 @@ def _revert(worktree_path: Path) -> None:
     for cmd in ([*HOOKLESS_GIT, "reset", "-q"],
                 [*HOOKLESS_GIT, "checkout", "--", "."],
                 [*HOOKLESS_GIT, "clean", "-fdq"]):
-        subprocess.run(cmd, cwd=worktree_path, capture_output=True)
+        subprocess.run(cmd, cwd=worktree_path, capture_output=True, env=git_env())
 
 
 def _notify_payload(task: AlertTask) -> NotificationPayload:
@@ -1929,6 +1936,13 @@ def main(argv=None):
     if args.scan:
         _run_scan(args)
         return
+
+    # Before anything can run repository code: from here on the operator's
+    # system and global git config are read from this copy, and only from it.
+    try:
+        git_config_snapshot()
+    except (RuntimeError, OSError, subprocess.CalledProcessError) as e:
+        sys.exit(f"Error: could not snapshot the git configuration: {e}")
 
     # --remote: clone-based pipeline (single repo or all Orca repos)
     if args.remote is not None:

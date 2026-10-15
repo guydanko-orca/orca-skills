@@ -354,6 +354,20 @@ because the baseline is per clone, every later alert in that clone — before th
 next git command. What it cannot see is a change made and reverted between two
 checks, or one outside git's config (a `~/.ssh/config` edit, say).
 
+The operator's own git configuration is read once, at the start of a run.
+Build checks keep the real `HOME`, so they can write `~/.gitconfig`; under
+`--remote all` every repository cloned after that would have read it, and the
+clone itself ran unchecked. So `agent_env.git_config_snapshot()` copies the
+effective system and global config (includes inlined, `include.path` keys
+dropped so nothing is followed back to a live file) into a private 0600 file in
+a 0700 temp directory, and every plugin git and gh call — clone, `ls-remote`,
+`run_agent.py` included — runs with `GIT_CONFIG_GLOBAL` pointing at it and
+`GIT_CONFIG_NOSYSTEM=1`. A change to `~/.gitconfig` during a run is not seen by
+the plugin. Conditional `includeIf "gitdir:…"` sections are evaluated against a
+neutral directory when the snapshot is taken, so they are lost. This needs git
+2.32 or later, and on older git the run refuses to start. Only 2.50 and 2.56 have
+been exercised.
+
 The `git-setup` subcommand, which only a human runs by hand, is left as it was.
 The trade-off is deliberate: repo-local hooks — formatters, linters,
 commit-message checks — no longer run on bot commits, so whatever they enforce

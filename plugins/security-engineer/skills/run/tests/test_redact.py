@@ -33,6 +33,8 @@ _DIR = Path(__file__).parent
 sys.path.insert(0, str(_DIR.parent))                 # skills/run/
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # skills/lib/
 
+sys.path.insert(0, str(_DIR))                        # tests/
+import _git_sandbox  # noqa: F401  (hermetic git config snapshot)
 import impact_agent
 import orchestrator
 import validator
