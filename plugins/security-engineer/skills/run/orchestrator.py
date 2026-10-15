@@ -39,6 +39,7 @@ from agent_env import (
     repo_code_guard,
     run_env,
     run_in_group,
+    signing_env,
 )
 from config import load_config
 from impact_agent import ImpactResult, analyze_impact
@@ -1139,10 +1140,10 @@ def _push_fix_update(task: AlertTask) -> None:
     commit_msg = f"fix(security): retry fix for {task.alert_id}"
     _run([*SAFE_GIT, "add", "--", *_declared_paths(task)], cwd=task.worktree_path,
          env=git_env())
-    # Credentialed from here: a signed commit needs the signing agent. The caller
-    # holds the clone exclusively and has just checked its config.
+    # The signing agent only — a clean filter can run during the commit. The
+    # caller holds the clone exclusively and has just checked its config.
     _run([*SAFE_GIT, "commit", "--no-verify", "-m", commit_msg], cwd=task.worktree_path,
-         env=credentialed_env())
+         env=signing_env())
     branch = alert_branch_name(task.alert_id)
     if not task.push_url:
         raise RuntimeError("no push URL was recorded for this clone — not pushing")

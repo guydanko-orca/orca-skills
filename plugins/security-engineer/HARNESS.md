@@ -357,9 +357,11 @@ That is all it proves: the command still runs as the operator with the real
 `HOME`, so it could read `~/.config/gh` or run `gh auth token`. What stops it is
 the drift check below, not the environment.
 
-Only the push, the commit (a signing agent may need its socket) and gh get
-credentials (`credentialed_env()`, which still drops the Orca token, the webhook
-and Claude's credentials). The push runs through `push_git()`: the operator's
+Only the push and gh get credentials (`credentialed_env()`, which still drops
+the Orca token, the webhook and Claude's credentials). The commit gets
+`signing_env()`: the credential-free environment plus the ssh/gpg agent's
+socket and home, because a clean filter can run during a commit — a canary test
+shows it sees the agent socket and no token. The push runs through `push_git()`: the operator's
 credential helpers, ssh command and askpass are taken from the snapshot, after
 `credential.helper=` has emptied every helper any config file named — verified
 with `git credential fill` that a helper planted in the repository, generic or

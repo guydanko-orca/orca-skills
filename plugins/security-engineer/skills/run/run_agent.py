@@ -15,7 +15,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
-from agent_env import SAFE_GIT, credentialed_env, git_env, neutral_dir, push_git
+from agent_env import (
+    SAFE_GIT,
+    credentialed_env,
+    git_env,
+    neutral_dir,
+    push_git,
+    signing_env,
+)
 from orca_client import (
     RISK_ORDER,
     _resolve_feature_type,
@@ -351,10 +358,9 @@ def cmd_git_commit(args):
 
     try:
         _stage(getattr(args, "path", None) or [])
-        # Credentialed only for a signing agent; the orchestrator calls this
-        # holding the clone exclusively, right after checking its config.
-        run([*SAFE_GIT, "commit", "--no-verify", "-m", args.message],
-            env=credentialed_env())
+        # The signing agent's socket and nothing else: a clean filter can run
+        # during the commit, and it gets no token.
+        run([*SAFE_GIT, "commit", "--no-verify", "-m", args.message], env=signing_env())
         sha, _, _ = run([*SAFE_GIT, "rev-parse", "--short", "HEAD"])
         print(sha)
     except RuntimeError as e:

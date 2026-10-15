@@ -598,6 +598,42 @@ class TestPlantedGitCommandsGetNoCredentials(unittest.TestCase):
                 with self.subTest(command=name, canary=canary):
                     self.assertNotIn(canary, dump)
 
+    def test_the_commit_hands_a_planted_filter_no_credential(self):
+        """A commit may need a signing agent; it never needs a token. A clean
+        filter that runs during the commit printed the canaries before."""
+        import argparse
+        import contextlib
+        import io
+
+        import run_agent
+        cwd = os.getcwd()
+        os.chdir(self.work)
+        try:
+            with patch.dict(os.environ, {"SSH_AUTH_SOCK": "/tmp/agent.sock"}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                run_agent.cmd_git_commit(argparse.Namespace(
+                    dry_run=False, alert_id="orca-1", message="fix", path=["app.py"]))
+                (self.work / "app.py").write_text("x = 3\n")
+                task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                                 feature_type="sast", source="app.py:1", alert_json={},
+                                 worktree_path=self.work, push_url="/nonexistent/remote.git",
+                                 fix_result=FixAgentResult(success=True,
+                                                           files_changed=["app.py"]))
+                with contextlib.suppress(RuntimeError):   # the push itself fails here
+                    orchestrator._push_fix_update(task)
+        finally:
+            os.chdir(cwd)
+        log = self.git("log", "--format=%s").stdout.split("\n")
+        self.assertIn("fix", log)
+        self.assertIn("fix(security): retry fix for orca-1", log)
+        fired = self._fired()
+        self.assertIn("filter", fired, "positive control: the filter ran")
+        for name, dump in fired.items():
+            for canary in self.CANARIES.values():
+                with self.subTest(command=name, canary=canary):
+                    self.assertNotIn(canary, dump)
+        self.assertIn("/tmp/agent.sock", fired["filter"], "the signing agent is kept")
+
     def test_the_push_prefix_runs_only_the_operators_credential_helpers(self):
         """`credential.helper=` empties the list — generic and URL-scoped helpers
         from every config file — and the snapshot's are added back."""

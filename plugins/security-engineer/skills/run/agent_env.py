@@ -339,6 +339,18 @@ def git_env() -> dict:
     return env
 
 
+# What a signed commit may need: the ssh or gpg agent's socket and home. No
+# token of any kind — a clean filter runs during the commit.
+_SIGNING_VARS = ("SSH_AUTH_SOCK", "GPG_AGENT_INFO", "GNUPGHOME", "GPG_TTY")
+
+
+def signing_env() -> dict:
+    """For `git commit`: git_env() plus the signing agent, and nothing more."""
+    env = git_env()
+    env.update({k: os.environ[k] for k in _SIGNING_VARS if k in os.environ})
+    return env
+
+
 # Local git calls — add, diff, status, commit, reset, checkout, worktree,
 # branch — need no network and no credential, so every way config can make them
 # reach for one is switched off: no credential helper, no askpass, an ssh that

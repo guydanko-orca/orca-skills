@@ -35,7 +35,7 @@ shell, and only for its ecosystem's lockfile command), and it runs with an
 allowlisted environment that excludes the Orca token and the webhook URL, with
 Claude Code told to scrub credentials from any command it runs. The plugin's own
 git reads a snapshot of your global git config taken when the run starts, gets
-credentials only for the push, the commit and gh, and refuses to touch a clone
+credentials only for the push and gh, and refuses to touch a clone
 whose git config changed while repository code ran. A
 private registry or a Bedrock deployment adds what it needs through
 `fix_agent.extra_env` — see [`config.example.yaml`](config.example.yaml).
