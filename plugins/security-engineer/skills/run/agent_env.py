@@ -55,6 +55,8 @@ _ALLOW = frozenset({
 # so one added through extra_env is withheld too.
 _MODEL_ONLY_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_")
 
+_SCRUB = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
+
 # Names fix_agent.extra_env may never add back. The literal four are the ones
 # this change exists to withhold; the pattern catches the shape of the rest, so
 # an operator adding AWS_REGION for Bedrock cannot also add AWS_SECRET_ACCESS_KEY
@@ -95,7 +97,15 @@ def agent_env(extra: list | None = None) -> dict:
                   f"environment", flush=True)
             continue
         allowed.add(name)
-    return {k: v for k, v in os.environ.items() if k in allowed}
+    env = {k: v for k, v in os.environ.items() if k in allowed}
+    # The fix agent's Bash runs lockfile regens — `bundle lock` evaluates the
+    # Gemfile, `dotnet restore` runs MSBuild targets — and inherits claude's own
+    # environment, which must hold Claude's credentials for the API call. This
+    # makes claude strip credential-shaped variables from every subprocess it
+    # starts while keeping them for itself. Forced, so an inherited "0" cannot
+    # turn it off. Verified against claude 2.1.299 with a canary variable.
+    env[_SCRUB] = "1"
+    return env
 
 
 def build_env(extra: list | None = None) -> dict:

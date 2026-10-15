@@ -32,7 +32,8 @@ nothing to pre-create.
 The fix agent is deliberately narrow: alert text reaches it fenced as data rather
 than as instructions, its tools are scoped per finding type (only a CVE gets a
 shell, and only for its ecosystem's lockfile command), and it runs with an
-allowlisted environment that excludes the Orca token and the webhook URL. A
+allowlisted environment that excludes the Orca token and the webhook URL, with
+Claude Code told to scrub credentials from any command it runs. A
 private registry or a Bedrock deployment adds what it needs through
 `fix_agent.extra_env` — see [`config.example.yaml`](config.example.yaml).
 

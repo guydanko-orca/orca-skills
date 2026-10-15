@@ -25,6 +25,7 @@ import package_identity
 import validator
 from agent_env import agent_env, build_env
 from orchestrator import AlertTask, _build_prompt_context, _invoke_fix_agent
+from pipelines import cve as cve_module
 from pipelines import get_pipeline
 from pipelines.base import FixPlan
 from pipelines.cve import CvePipeline
@@ -416,6 +417,28 @@ class TestAgentEnv(unittest.TestCase):
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}):
             self.assertIn("ANTHROPIC_API_KEY", agent_env([]))
 
+    def test_claude_scrubs_its_own_subprocesses(self):
+        """The fix agent's Bash runs `bundle lock`, `dotnet restore`, `go get` —
+        each can execute repository code — and inherits claude's environment,
+        which has to hold Claude's credentials. The scrub strips them from what
+        claude starts while claude keeps them for its API calls."""
+        with patch.dict(os.environ, {"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
+                                     "ANTHROPIC_API_KEY": "k"}):
+            env = agent_env([])
+        self.assertEqual(env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1")
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "k")
+
+    def test_fix_agent_subprocess_gets_the_scrub(self):
+        alert = {"alert_id": "orca-1", "feature_type": "cve", "file_path": "go.mod"}
+        task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                         feature_type="cve", source="go.mod", alert_json=alert,
+                         worktree_path=Path("/tmp/orca-fix-x"))
+        with patch("subprocess.run") as run, patch("agent_env.load_config") as cfg:
+            cfg.return_value.fix_agent.extra_env = []
+            run.return_value = MagicMock(returncode=1, stdout="", stderr="x")
+            _invoke_fix_agent(task, dry_run=False, timeout_sec=5)
+        self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1")
+
     def test_every_model_subprocess_passes_env(self):
         """All four call sites, not just the one with a shell."""
         sites = [
@@ -493,6 +516,25 @@ class TestBuildCheckEnv(unittest.TestCase):
             finally:
                 os.chdir(cwd)
         self.assertTrue(result.passed, result.failures)
+
+    def test_cve_resolve_check_cannot_see_our_credentials(self):
+        """`go build` / `cargo metadata` after a bump run from pipeline code."""
+        def resolve(dump, cwd):
+            with patch.dict(cve_module._RESOLVE_CHECKS,
+                            {"go": ([sys.executable, "-c", dump], "go.mod")}):
+                return CvePipeline()._resolve_check({"ecosystem": "go"}, "go.mod", cwd)
+        seen = self._env_seen_by(resolve, [])
+        for name in self.WITHHELD:
+            self.assertNotIn(name, seen, name)
+        self.assertNotIn("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", build_env([]))
+
+    def test_pipeline_code_runs_nothing_outside_the_build_check(self):
+        """The regen commands are Bash allowlist entries for the agent, not
+        something pipeline code runs; anything it does run goes through
+        validator._run_check and so through build_env()."""
+        src = inspect.getsource(cve_module)
+        self.assertNotIn("subprocess", src)
+        self.assertNotIn("os.system", src)
 
     def test_every_build_subprocess_passes_build_env(self):
         for name in ("_run_check", "_check_python"):

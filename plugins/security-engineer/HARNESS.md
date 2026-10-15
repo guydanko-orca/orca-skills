@@ -287,6 +287,23 @@ subprocesses keep their environment: they need those credentials and are not the
 untrusted party. The hooks a repository attaches to them are — see *Repository
 hooks do not run on the plugin's git* below.
 
+The fix agent's own Bash is the one place repository code runs inside the model
+subprocess. A CVE's lockfile regen executes it — `bundle lock` evaluates the
+Gemfile, `dotnet restore` runs MSBuild targets, `go get` can run a toolchain the
+module names — and it inherits `claude`'s environment, which cannot drop
+`ANTHROPIC_API_KEY` because `claude` needs it. So `agent_env()` always sets
+`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`: Claude Code keeps its credentials for its
+own API calls and strips credential-shaped variables, by name or by value, from
+every subprocess it starts. Verified against claude 2.1.299 with a canary — a
+`CANARYZ_API_KEY` set for `claude -p` was visible to `printenv` in its Bash
+without the scrub and gone with it, while a plain variable survived both ways.
+What it does not cover: before claude 2.1.251 it removed only
+`ANTHROPIC_API_KEY` and `AWS_SECRET_ACCESS_KEY`; it matches shapes, so a secret
+whose name and value look ordinary passes; and, like `build_env()`, it leaves
+files under `HOME` readable. The regen commands are never run by pipeline code —
+what pipeline code does run (`go build`, `cargo metadata`) goes through
+`validator._run_check` and so through `build_env()`.
+
 **A cloned tree is input, never configuration.** `--remote all` clones arbitrary
 tenant repositories into `/tmp`, and the fix agent runs with `cwd` inside one.
 A repository configures Claude Code simply by containing files — `CLAUDE.md`,
