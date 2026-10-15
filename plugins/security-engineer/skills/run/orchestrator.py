@@ -1140,6 +1140,15 @@ def _push_fix_update(task: AlertTask) -> None:
     commit_msg = f"fix(security): retry fix for {task.alert_id}"
     _run([*SAFE_GIT, "add", "--", *_declared_paths(task)], cwd=task.worktree_path,
          env=git_env())
+    # The same refusal as the first commit's: anything left unstaged is either an
+    # under-reported fix or debris, and neither is pushed.
+    from run_agent import leftover_paths
+    status, _, _ = _run([*SAFE_GIT, "status", "--porcelain", "--untracked-files=all"],
+                        cwd=task.worktree_path, env=git_env())
+    leftover = leftover_paths(status)
+    if leftover:
+        raise RuntimeError("worktree holds changes the fix agent did not report: "
+                           + ", ".join(sorted(leftover)[:10]))
     # The signing agent only — a clean filter can run during the commit. The
     # caller holds the clone exclusively and has just checked its config.
     _run([*SAFE_GIT, "commit", "--no-verify", "-m", commit_msg], cwd=task.worktree_path,

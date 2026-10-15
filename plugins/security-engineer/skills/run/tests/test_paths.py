@@ -203,6 +203,44 @@ class TestUnaccountedChangesBlockTheCommit(unittest.TestCase):
                              [*run_agent.SAFE_GIT, "add", "-A"])
 
 
+class TestRetryPushRefusesUndeclaredChanges(unittest.TestCase):
+    """The first commit refuses a worktree holding changes the agent did not
+    report; the retry commit did not check, so a retry's leftovers were pushed."""
+
+    def test_a_leftover_fails_the_retry_before_it_commits(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull,
+                                     "GIT_CONFIG_NOSYSTEM": "1"}):
+            saved = agent_env._snapshot_state()
+            agent_env._reset_git_config_snapshot()
+            try:
+                work = Path(d)
+                git = lambda *a: subprocess.run(  # noqa: E731
+                    ["git", *a], cwd=work, capture_output=True, text=True,
+                    stdin=subprocess.DEVNULL)
+                git("init", "-q", "-b", "main")
+                for key, value in (("user.name", "t"), ("user.email", "t@e"),
+                                   ("commit.gpgsign", "false")):
+                    git("config", key, value)
+                (work / "app.py").write_text("x = 1\n")
+                git("add", "app.py")
+                git("commit", "-qm", "init")
+                (work / "app.py").write_text("x = 2\n")
+                (work / "scratch.env").write_text("dumped\n")
+                task = AlertTask(alert_id="orca-1", title="t", risk_level="high",
+                                 feature_type="sast", source="app.py:1", alert_json={},
+                                 worktree_path=work, push_url="/nonexistent.git",
+                                 fix_result=FixAgentResult(success=True,
+                                                           files_changed=["app.py"]))
+                with self.assertRaises(RuntimeError) as ctx:
+                    orchestrator._push_fix_update(task)
+                self.assertIn("scratch.env", str(ctx.exception))
+                self.assertEqual(git("rev-list", "--count", "HEAD").stdout.strip(), "1")
+            finally:
+                agent_env._restore_snapshot_state(saved)
+
+
 class TestClonedTreesCannotConfigureTheAgent(unittest.TestCase):
     """A repository configures Claude Code just by containing files. The fix
     agent runs with cwd inside a repo cloned from the tenant."""
@@ -632,7 +670,10 @@ class TestPlantedGitCommandsGetNoCredentials(unittest.TestCase):
             for canary in self.CANARIES.values():
                 with self.subTest(command=name, canary=canary):
                     self.assertNotIn(canary, dump)
-        self.assertIn("/tmp/agent.sock", fired["filter"], "the signing agent is kept")
+        filter_dumps = [m.read_text() for m in self.markers.iterdir()
+                        if m.name.startswith("filter-")]
+        self.assertTrue(any("/tmp/agent.sock" in d for d in filter_dumps),
+                        "the commit keeps the signing agent")
 
     def test_the_push_prefix_runs_only_the_operators_credential_helpers(self):
         """`credential.helper=` empties the list — generic and URL-scoped helpers
@@ -1409,6 +1450,7 @@ if __name__ == "__main__":
         TestAssertDisposable,
         TestDeclaredPaths,
         TestUnaccountedChangesBlockTheCommit,
+        TestRetryPushRefusesUndeclaredChanges,
         TestClonedTreesCannotConfigureTheAgent,
         TestAlertPathsCannotEscapeTheWorktree,
         TestRepoHooksDoNotRunOnPluginGit,

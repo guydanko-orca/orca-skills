@@ -696,3 +696,53 @@ Stated plainly, because a gate list reads as a guarantee otherwise.
 - **Gate 4 depends on an integration outside this repo.** If the Orca GitHub App
   is not posting checks, the strongest gate degrades to `needs-review`.
   `on_not_found: fail` makes that loud where silence is worse.
+
+---
+
+## Residual risk
+
+The git and credential controls above narrow what repository code can reach.
+They do not contain it, and this section says where they stop.
+
+**The structural limit.** The fix agent's lockfile regens and every build check
+run tenant-written code as the operator: same OS user, real `HOME`, same network.
+That code can:
+- read anything the operator can (`~/.config/gh`, `~/.ssh`, `~/.aws`), or run
+  `gh auth token`;
+- write `~/.gitconfig`. The plugin's own git ignores that, through the snapshot,
+  but the operator's other tools do not, and the plugin neither detects nor
+  reports the change;
+- find and rewrite the plugin's config snapshot. That is detected by its hash,
+  and the run fails closed, but it cannot be prevented;
+- leave its process group with `setsid()` or `setpgid()` and outlive the
+  check;
+- make and revert a config change between two checks;
+- change things outside git config, such as `~/.ssh/config`.
+
+The environment allowlists and the git overrides decide what such code is
+*handed*. They are not a sandbox. Real containment means running the fix agent
+and the build checks in a sandbox — a container, or a separate OS user with no
+access to the operator's home or credentials. **That is the follow-up design item
+this harness needs, and it should be tracked as one.**
+
+**Commits the gates never see.** A build or regen step can run `git add` or
+`git commit` itself, in the worktree. The gates judge `git diff` against HEAD,
+so a commit made that way is not in the diff they read, and the push sends HEAD
+— that commit included. This is also true on `main`. Both commit paths now
+refuse a worktree with undeclared changes left over, but that does not cover a
+commit already made.
+
+**Known plugin-git config writes.** Only git-lfs's `lfs.<url>.access` and
+`lfs.<url>.locksverify` are accepted after plugin git runs. Any other config
+write by a tool the plugin invokes — a future git, a credential helper writing
+into repository config — poisons the clone and fails every later alert in it.
+
+**Untested here:**
+- a live HTTPS push and the real gh credential flow;
+- `url.*.insteadOf` and `pushInsteadOf` rewrites in the push window, which only
+  the drift check covers;
+- git older than 2.32, where only the refuse-to-start path is tested, by mock;
+- process-group escapees;
+- the pid-reuse window of the `waitid` fallback on macOS CPython before 3.13;
+- partial clones, which `protocol.allow=never` makes fail rather than fetch.
+

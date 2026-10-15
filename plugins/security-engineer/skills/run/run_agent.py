@@ -341,8 +341,13 @@ def _unaccounted_changes():
     We cannot tell those apart from here, and both are reasons not to push.
     """
     out, _, _ = run([*SAFE_GIT, "status", "--porcelain", "--untracked-files=all"])
+    return leftover_paths(out)
+
+
+def leftover_paths(porcelain: str) -> list:
+    """From `git status --porcelain` after staging: what was not staged by name."""
     leftover = []
-    for line in out.splitlines():
+    for line in porcelain.splitlines():
         if len(line) < 4:
             continue
         index_state, worktree_state, path = line[0], line[1], line[3:]
