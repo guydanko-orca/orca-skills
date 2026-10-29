@@ -1,0 +1,21 @@
+README.md
+  s_3c77efaa777dda::t_b914148b1fe60c 41,74,93-94,146,1502-1555
+skills/orca-code-scanner/SKILL.md
+  s_3c77efaa777dda::t_5f85b4c18d6f85 1-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1d8d86dd3d65f488919ebc30c17e8b50fb4b33ef",
+  "prompts": {},
+  "sessions": {
+    "s_3c77efaa777dda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "76c26ed3-3ea9-4a23-a372-4e600458d2bf",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Guy Dankovich <guy.dankovich@orca.security>"
+    }
+  }
+}
