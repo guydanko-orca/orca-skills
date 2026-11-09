@@ -1,0 +1,28 @@
+skills/orca-code-scanner/SKILL.md
+  s_2ea1e007a10160::t_4de45c5e2f9636 44-45
+  s_2ea1e007a10160::t_4e9e965bc53dd1 61-62
+  s_2ea1e007a10160::t_c012e43b354ad4 3,7-10,30-43,46-58,79-83,87,91,97,99,103
+README.md
+  s_2ea1e007a10160::t_d87518a6361eac 1554
+  s_2ea1e007a10160::t_050e7901727598 41
+  s_2ea1e007a10160::t_6c9f23adc50c6e 1514,1517-1522,1529-1530
+  s_2ea1e007a10160::t_9cea6ca03f7bd7 1531
+.codex-plugin/plugin.json
+  s_2ea1e007a10160::t_68700ce6d0b55a 35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2ad15122adde7f027392675dd9b52ac75e0e817f",
+  "prompts": {},
+  "sessions": {
+    "s_2ea1e007a10160": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e823c527-4f61-4597-98dc-365902da521e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Guy Dankovich <guy.dankovich@orca.security>"
+    }
+  }
+}
